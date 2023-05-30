@@ -6,3 +6,5 @@ repository = "https://github.com/mustermeiszer/dirigent.git"
 version = "0.1.0"
 
 [dependencies]
+futures = "0.3.28"
+dyn-clone = "1.0.11"
