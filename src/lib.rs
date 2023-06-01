@@ -18,16 +18,24 @@
 #![feature(box_into_inner)]
 
 use core::{any::TypeId, marker::PhantomData};
+use std::{
+	pin::Pin,
+	sync::{Arc, Mutex},
+	task::{Context, Poll},
+};
 
 use futures::Future;
 
 use crate::{
 	envelope::Envelope,
-	traits::{Index as _, Process as _, Process, Program, Spawner},
+	traits::{ExitStatus, Index as _, Process as _, Process, Program, Spawner},
 };
 
 pub mod channel;
 pub mod envelope;
+pub mod spawner;
+#[cfg(test)]
+mod tests;
 pub mod traits;
 
 #[derive(Copy, Clone)]
@@ -45,6 +53,8 @@ enum Command<P> {
 	FetchRunning(channel::Sender<Vec<Pid>>),
 	Kill(Pid),
 	KillAll,
+	Shutdown,
+	ForceShutdown,
 }
 
 struct Instrum<P> {
@@ -52,15 +62,15 @@ struct Instrum<P> {
 	programm: P,
 }
 
-struct ActiveInstrum<P: Program, I: traits::Process<P>> {
+struct ActiveInstrum<P: Program, I: Process<P>> {
 	pid: Pid,
 	instance: I,
 	inbound: channel::Receiver<Envelope>,
 	_phantom: PhantomData<P>,
 }
 
-impl<P: Program, I: traits::Process<P>> ActiveInstrum<P, I> {
-	async fn produced(&mut self) -> Option<Envelope> {
+impl<P: Program, I: Process<P>> ActiveInstrum<P, I> {
+	async fn produced(&self) -> Option<Envelope> {
 		// TODO: Handle error or make the method non result
 		self.inbound
 			.try_recv()
@@ -68,7 +78,7 @@ impl<P: Program, I: traits::Process<P>> ActiveInstrum<P, I> {
 			.expect("Failed receiving from Process. Panic...")
 	}
 
-	async fn try_consume(&mut self, envelope: Envelope) {
+	async fn try_consume(&self, envelope: Envelope) {
 		if <P as Program>::Consumes::indexed(&envelope) {
 			// TOD0: Fix error or make not result
 			self.instance
@@ -95,20 +105,24 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 			spawner,
 			scheduled: Vec::new(),
 			running: Vec::new(),
-
 			takt_sender,
 			receiver,
 		}
 	}
 
 	pub fn begin(mut self) -> Takt<P> {
-		let spawner = self.spawner.clone();
-		let sender = self.takt_sender.clone();
+		let Dirigent {
+			spawner,
+			receiver,
+			mut running,
+			takt_sender,
+			scheduled,
+		} = self;
 
-		let fut = async move {
+		let fut = Box::pin(async move {
 			loop {
 				// Serve commands first
-				if let Ok(cmd) = self.receiver.try_recv().await {
+				if let Ok(cmd) = receiver.try_recv().await {
 					if let Some(cmd) = cmd {
 						match cmd {
 							Command::Schedule { .. } => {}
@@ -117,6 +131,8 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 							Command::Preempt(_) => {}
 							Command::Kill(_) => {}
 							Command::KillAll => {}
+							Command::ForceShutdown => {}
+							Command::Shutdown => break,
 						}
 					}
 				} else {
@@ -127,8 +143,8 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 				// Serve processes
 				//
 				// Collect messages first
-				let mut envelopes = Vec::with_capacity(self.running.len());
-				for active in &mut self.running {
+				let mut envelopes = Vec::with_capacity(running.len());
+				for active in running {
 					if let Some(envelope) = active.produced().await {
 						envelopes.push(envelope)
 					}
@@ -136,17 +152,20 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 
 				// Distribute messages
 				for envelope in envelopes {
-					for active in &mut self.running {
-						active.try_consume(envelope.clone()).await
+					for active in running {
+						let cloned_envelope = envelope.clone();
+						active.try_consume(cloned_envelope).await
 					}
 				}
 			}
-		};
 
-		spawner.spawn(Box::new(fut));
+			ExitStatus::Finished
+		});
+
+		spawner.spawn(fut);
 
 		Takt {
-			sender,
+			sender: takt_sender,
 			_phantom: Default::default(),
 		}
 	}
@@ -255,7 +274,10 @@ where
 
 pub enum State {
 	Uninit,
-	Init(Box<dyn Future<Output = traits::ExitStatus>>),
+	Init(Box<dyn Future<Output = ExitStatus> + Send>),
+	Running(RefSpawnedInstance),
+	Preempted(RefSpawnedInstance),
+	Exited,
 }
 
 pub struct Instance<P> {
@@ -264,33 +286,139 @@ pub struct Instance<P> {
 	_phantom: PhantomData<P>,
 }
 
-impl<P: traits::Program> traits::Process<P> for Instance<P> {
-	fn init(&mut self, state: Box<dyn Future<Output = traits::ExitStatus>>) {
-		self.state = State::Init(state);
+#[pin_project::pin_project]
+struct SpawnedInstance {
+	#[pin]
+	inner: Pin<Box<dyn Future<Output = ExitStatus> + Send>>,
+	instance_state: Arc<Mutex<InstanceState>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum InstanceState {
+	Preempted,
+	Running,
+	Killed,
+}
+
+#[derive(Clone)]
+pub struct RefSpawnedInstance(Arc<Mutex<InstanceState>>);
+
+impl Future for SpawnedInstance {
+	type Output = ExitStatus;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = self.project();
+		if let Some(state) = this.instance_state.lock().ok() {
+			match *state {
+				InstanceState::Running => this.inner.poll(cx),
+				InstanceState::Preempted => Poll::Pending,
+				InstanceState::Killed => Poll::Ready(ExitStatus::Interrupted),
+			}
+		} else {
+			Poll::Ready(ExitStatus::Error)
+		}
+	}
+}
+
+impl<P: traits::Program> Instance<P> {
+	fn running(&self) -> bool {
+		match &self.state {
+			State::Uninit | State::Init(_) | State::Preempted(_) | State::Exited => false,
+			State::Running(_) => true,
+		}
+	}
+
+	fn alive(&self) -> bool {
+		match &self.state {
+			State::Uninit | State::Init(_) | State::Exited => false,
+			State::Running(_) | State::Preempted(_) => true,
+		}
+	}
+}
+
+impl<P: Program> Process<P> for Instance<P> {
+	fn init(
+		&mut self,
+		state: Box<dyn Future<Output = traits::ExitStatus> + Send>,
+	) -> Result<(), ()> {
+		match self.state {
+			State::Uninit => {
+				self.state = State::Init(state);
+				Ok(())
+			}
+			State::Init(_) | State::Running(_) | State::Preempted(_) | State::Exited => Err(()),
+		}
 	}
 
 	fn initialized(&self) -> bool {
 		match &self.state {
-			State::Uninit => false,
+			State::Uninit | State::Running(_) | State::Preempted(_) | State::Exited => false,
 			State::Init(_) => true,
 		}
 	}
 
-	async fn send(&mut self, msg: impl Into<Envelope>) -> Result<(), ()> {
+	fn start(&mut self, spawner: impl Spawner) {
+		if self.initialized() {
+			let mut state = State::Uninit;
+			core::mem::swap(&mut self.state, &mut state);
+
+			if let State::Init(state) = state {
+				let instance_state = Arc::new(Mutex::new(InstanceState::Running));
+
+				let spawned_instance = SpawnedInstance {
+					inner: Box::into_pin(state),
+					instance_state: instance_state.clone(),
+				};
+				spawner.spawn(spawned_instance);
+
+				self.state = State::Running(RefSpawnedInstance(instance_state))
+			} else {
+				unreachable!("Control flow prohibits this state.")
+			}
+		} else {
+			// TODO: Error here
+		}
+	}
+
+	async fn send(&self, msg: impl Into<Envelope>) -> Result<(), ()> {
 		let env: Envelope = msg.into();
 
-		if self.initialized() && P::Consumes::indexed(&env) {
+		// TODO: Might wanna remove the program if not alive?
+		if self.alive() {
 			self.inbound.send(env).await
 		} else {
 			Ok(())
 		}
 	}
 
+	// TODO: Research race-conditions
 	async fn preempt(&mut self) -> Result<(), ()> {
-		todo!()
+		let spawned = match &self.state {
+			State::Uninit | State::Init(_) | State::Preempted(_) | State::Exited => return Err(()),
+			State::Running(spawned) => {
+				let mut l = spawned.0.lock().map_err(|_| ())?;
+				*l = InstanceState::Preempted;
+
+				spawned
+			}
+		};
+
+		self.state = State::Preempted(spawned.clone());
+
+		Ok(())
 	}
 
-	async fn kill(&mut self) {
-		todo!()
+	// TODO: Research race-conditions
+	async fn kill(&mut self) -> Result<(), ()> {
+		match &self.state {
+			State::Uninit | State::Init(_) | State::Exited => return Err(()),
+			State::Running(spawned) | State::Preempted(spawned) => {
+				let mut l = spawned.0.lock().map_err(|_| ())?;
+				*l = InstanceState::Killed;
+			}
+		}
+		self.state = State::Exited;
+
+		Ok(())
 	}
 }

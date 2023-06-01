@@ -167,7 +167,7 @@ impl Envelope {
 			.ok_or(EnvelopeError::MessageNotExpected)
 	}
 
-	pub async fn answer<M: Message>(&self, msg: M::Response) -> Result<(), EnvelopeError> {
+	pub async fn answer<M: Message>(&mut self, msg: M::Response) -> Result<(), EnvelopeError> {
 		let letter = self.read_as_letter_ref::<M>()?;
 
 		if let Some(response) = &letter.responder {

@@ -15,8 +15,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const DEFAULT_CHANNEL_SIZE: usize = 2048;
+
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-	let (inner_sender, inner_recv) = std::sync::mpsc::channel::<T>();
+	channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
+}
+
+pub fn channel_sized<T, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+	/*
+	let (inner_sender, inner_recv) = futures::channel::mpsc::channel::<T>(SIZE);
 
 	(
 		Sender {
@@ -24,9 +31,13 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 		},
 		Receiver { inner: inner_recv },
 	)
+
+	 */
+	todo!()
 }
 
 pub struct Sender<T> {
+	//inner: futures::channel::mpsc::Sender<T>,
 	inner: std::sync::mpsc::Sender<T>,
 }
 
@@ -40,26 +51,20 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Sender<T> {
 	pub async fn send(&self, t: impl Into<T>) -> Result<(), ()> {
-		self.inner.send(t.into()).map_err(|_| ())
+		todo!()
 	}
 }
 
 pub struct Receiver<T> {
-	inner: std::sync::mpsc::Receiver<T>,
+	inner: futures::channel::mpsc::Receiver<T>,
 }
 
 impl<T> Receiver<T> {
 	pub async fn recv(&self) -> Result<T, ()> {
-		self.inner.recv().map_err(|_| ())
+		todo!()
 	}
 
 	pub async fn try_recv(&self) -> Result<Option<T>, ()> {
-		match self.inner.try_recv() {
-			Ok(t) => Ok(Some(t)),
-			Err(e) => match e {
-				std::sync::mpsc::TryRecvError::Empty => Ok(None),
-				std::sync::mpsc::TryRecvError::Disconnected => Err(()),
-			},
-		}
+		todo!()
 	}
 }

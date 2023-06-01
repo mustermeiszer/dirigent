@@ -16,6 +16,7 @@
 // limitations under the License.
 
 use core::{any::Any, future::Future};
+use std::pin::Pin;
 
 use crate::{channel, envelope, envelope::Envelope};
 
@@ -33,7 +34,7 @@ pub trait LookUp {
 	fn look_up(t: &Envelope) -> Result<Self::Output, ()>;
 }
 
-pub trait Program: 'static + Sized {
+pub trait Program: 'static + Sized + Send {
 	type Process: Process<Self>;
 	type Consumes: Index;
 
@@ -68,21 +69,23 @@ pub enum ExitStatus {
 	Interrupted,
 }
 
-pub trait Process<P: Program> {
-	fn init(&mut self, state: Box<dyn Future<Output = ExitStatus>>);
+pub trait Process<P: Program>: Send + 'static {
+	fn init(&mut self, state: Box<dyn Future<Output = ExitStatus> + Send>) -> Result<(), ()>;
 
 	fn initialized(&self) -> bool;
 
-	async fn send(&mut self, msg: impl Into<Envelope>) -> Result<(), ()>;
+	fn start(&mut self, spawner: impl Spawner);
+
+	async fn send(&self, msg: impl Into<Envelope>) -> Result<(), ()>;
 
 	async fn preempt(&mut self) -> Result<(), ()>;
 
-	async fn kill(&mut self);
+	async fn kill(&mut self) -> Result<(), ()>;
 }
 
 pub trait Spawner: Clone + Send + Sync {
 	/// Spawn the given blocking future.
-	fn spawn_blocking(&self, future: Box<dyn Future<Output = ExitStatus>>);
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static);
 	/// Spawn the given non-blocking future.
-	fn spawn(&self, future: Box<dyn Future<Output = ExitStatus>>);
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static);
 }
