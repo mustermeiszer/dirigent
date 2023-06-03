@@ -10,3 +10,5 @@ futures = "0.3.28"
 dyn-clone = "1.0.11"
 pin-project = "1.1.0"
 tokio = { version = "1.25.0", features = ["full"] }
+async-trait = "0.1.68"
+sync_wrapper = "0.1.2"

@@ -14,3 +14,26 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use crate as dirigent;
+use crate::{envelope::Envelope, traits::Index};
+
+struct TestProgram;
+
+struct NoIndex;
+impl Index for NoIndex {
+	fn indexed(t: &Envelope) -> bool {
+		true
+	}
+}
+
+#[async_trait::async_trait]
+impl dirigent::traits::Program for TestProgram {
+	type Consumes = NoIndex;
+
+	async fn start<C: dirigent::traits::Context>(self, ctx: C) -> C::Process {
+		todo!()
+	}
+}
+
+#[test]
+fn test_1() {}

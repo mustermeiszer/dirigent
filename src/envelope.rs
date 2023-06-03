@@ -124,7 +124,7 @@ impl From<ResponseError> for EnvelopeError {
 
 #[derive(Clone)]
 pub struct Envelope {
-	inner: Arc<Box<dyn Any>>,
+	inner: Arc<Box<dyn Any + Send + Sync>>,
 	read: Arc<Mutex<bool>>,
 }
 
@@ -140,7 +140,7 @@ impl<M: Message> From<M> for Envelope {
 }
 
 impl Envelope {
-	pub fn letter_id(&self) -> TypeId {
+	pub fn message_id(&self) -> TypeId {
 		self.inner.type_id()
 	}
 

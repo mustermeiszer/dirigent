@@ -15,13 +15,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::marker::PhantomData;
+
 const DEFAULT_CHANNEL_SIZE: usize = 2048;
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 	channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
 }
 
-pub fn channel_sized<T, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
 	/*
 	let (inner_sender, inner_recv) = futures::channel::mpsc::channel::<T>(SIZE);
 
@@ -36,20 +38,19 @@ pub fn channel_sized<T, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
 	todo!()
 }
 
-pub struct Sender<T> {
+pub struct Sender<T: Send> {
 	//inner: futures::channel::mpsc::Sender<T>,
-	inner: std::sync::mpsc::Sender<T>,
+	//inner: std::sync::mpsc::Sender<T>,
+	_phantom: PhantomData<T>,
 }
 
-impl<T> Clone for Sender<T> {
+impl<T: Send> Clone for Sender<T> {
 	fn clone(&self) -> Self {
-		Sender {
-			inner: self.inner.clone(),
-		}
+		todo!()
 	}
 }
 
-impl<T> Sender<T> {
+impl<T: Send> Sender<T> {
 	pub async fn send(&self, t: impl Into<T>) -> Result<(), ()> {
 		todo!()
 	}
