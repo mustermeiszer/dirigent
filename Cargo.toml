@@ -12,3 +12,4 @@ pin-project = "1.1.0"
 tokio = { version = "1.25.0", features = ["full"] }
 async-trait = "0.1.68"
 sync_wrapper = "0.1.2"
+flume = "0.10.14"

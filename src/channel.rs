@@ -17,15 +17,14 @@
 
 use std::marker::PhantomData;
 
-const DEFAULT_CHANNEL_SIZE: usize = 2048;
+const DEFAULT_CHANNEL_SIZE: usize = 512;
 
 pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 	channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
 }
 
 pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
-	/*
-	let (inner_sender, inner_recv) = futures::channel::mpsc::channel::<T>(SIZE);
+	let (inner_sender, inner_recv) = flume::bounded::<T>(SIZE);
 
 	(
 		Sender {
@@ -33,39 +32,33 @@ pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
 		},
 		Receiver { inner: inner_recv },
 	)
-
-	 */
-	todo!()
 }
 
+#[derive(Clone)]
 pub struct Sender<T: Send> {
-	//inner: futures::channel::mpsc::Sender<T>,
-	//inner: std::sync::mpsc::Sender<T>,
-	_phantom: PhantomData<T>,
-}
-
-impl<T: Send> Clone for Sender<T> {
-	fn clone(&self) -> Self {
-		todo!()
-	}
+	inner: flume::Sender<T>,
 }
 
 impl<T: Send> Sender<T> {
-	pub async fn send(&self, t: impl Into<T>) -> Result<(), ()> {
-		todo!()
+	pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
+		self.inner.send_async(t.into()).await.map_err(|_| ())
+	}
+
+	pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
+		self.inner.try_send(t.into()).map_err(|_| ())
 	}
 }
 
-pub struct Receiver<T> {
-	inner: futures::channel::mpsc::Receiver<T>,
+pub struct Receiver<T: Send> {
+	inner: flume::Receiver<T>,
 }
 
-impl<T> Receiver<T> {
+impl<T: Send> Receiver<T> {
 	pub async fn recv(&self) -> Result<T, ()> {
-		todo!()
+		self.inner.recv_async().await.map_err(|_| ())
 	}
 
 	pub async fn try_recv(&self) -> Result<Option<T>, ()> {
-		todo!()
+		self.inner.try_recv().map_err(|_| ()).map(|t| Some(t))
 	}
 }
