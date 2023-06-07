@@ -15,23 +15,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate as dirigent;
-use crate::{envelope::Envelope, traits::Index};
+use crate::{
+	envelope::Envelope,
+	traits::{Index, Process},
+};
 
-struct TestProgram;
-
-struct NoIndex;
-impl Index for NoIndex {
+struct AllIndexed;
+impl Index for AllIndexed {
 	fn indexed(t: &Envelope) -> bool {
 		true
 	}
 }
 
+struct TestProgram1;
 #[async_trait::async_trait]
-impl dirigent::traits::Program for TestProgram {
-	type Consumes = NoIndex;
+impl dirigent::traits::Program for TestProgram1 {
+	type Consumes = AllIndexed;
 
-	async fn start<C: dirigent::traits::Context>(self, ctx: C) -> C::Process {
-		todo!()
+	async fn start<C: dirigent::traits::Context>(self, mut ctx: C) -> C::Process {
+		let mut p = ctx.create_process();
+
+		let fut = async move { println!("Hello, World from Test Programm 1!") };
+
+		p.init(fut);
+		p
+	}
+}
+
+struct TestProgram2;
+#[async_trait::async_trait]
+impl dirigent::traits::Program for TestProgram2 {
+	type Consumes = AllIndexed;
+
+	async fn start<C: dirigent::traits::Context>(self, mut ctx: C) -> C::Process {
+		let mut p = ctx.create_process();
+
+		let fut = async move { println!("Hello, World from Test Programm 1!") };
+
+		p.init(fut);
+		p
 	}
 }
 
