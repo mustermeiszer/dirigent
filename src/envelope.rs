@@ -23,6 +23,7 @@ type Arc<T> = std::sync::Arc<T>;
 
 use crate::{channel, traits, traits::Message};
 
+#[derive(Debug)]
 pub enum ResponseError {
 	TooManyResponses,
 	ResponseReceiverDropped,
@@ -109,6 +110,7 @@ impl<M: Message> Letter<M> {
 	}
 }
 
+#[derive(Debug)]
 pub enum EnvelopeError {
 	Response(ResponseError),
 	WrongResponse,

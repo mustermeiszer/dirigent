@@ -3,6 +3,8 @@
 // Copyright (C) Frederik Gartenmeister.
 // SPDX-License-Identifier: Apache-2.0
 
+use tokio::runtime::Handle;
+
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,45 +19,78 @@
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
-	traits::{Index, Process},
+	traits::{Context, ExitStatus, Index, Process, Program},
 };
 
-struct AllIndexed;
-impl Index for AllIndexed {
-	fn indexed(t: &Envelope) -> bool {
-		true
-	}
+#[derive(Clone)]
+struct Message {
+	text: &'static str,
 }
 
+impl dirigent::traits::Message for Message {
+	type Response = ();
+}
+
+#[derive(Clone)]
 struct TestProgram1;
 #[async_trait::async_trait]
 impl dirigent::traits::Program for TestProgram1 {
-	type Consumes = AllIndexed;
+	async fn start(self: Box<Self>, mut ctx: Box<dyn Context>) -> ExitStatus {
+		println!("Hello, World from Test Programm 1!");
 
-	async fn start<C: dirigent::traits::Context>(self, mut ctx: C) -> C::Process {
-		let mut p = ctx.create_process();
+		let msg = Message {
+			text: "Hello From Program 1",
+		};
+		ctx.send(msg.into()).await.unwrap();
 
-		let fut = async move { println!("Hello, World from Test Programm 1!") };
+		// Will never receive
+		ctx.recv().await.unwrap();
 
-		p.init(fut);
-		p
+		println!("NEEVER");
+
+		Ok(())
 	}
 }
 
+#[derive(Clone)]
 struct TestProgram2;
 #[async_trait::async_trait]
 impl dirigent::traits::Program for TestProgram2 {
-	type Consumes = AllIndexed;
+	async fn start(self: Box<Self>, mut ctx: Box<dyn Context>) -> ExitStatus {
+		println!("Hello, World from Test Programm 2!");
 
-	async fn start<C: dirigent::traits::Context>(self, mut ctx: C) -> C::Process {
-		let mut p = ctx.create_process();
+		let msg = Message {
+			text: "Hello From Program 2",
+		};
+		ctx.send(msg.into()).await.unwrap();
 
-		let fut = async move { println!("Hello, World from Test Programm 1!") };
+		let envelope = ctx.recv().await.unwrap();
 
-		p.init(fut);
-		p
+		let msg = envelope.read_ref::<Message>().unwrap();
+
+		println!("{}", msg.text);
+
+		Ok(())
+	}
+
+	fn index(&self) -> Box<dyn Index> {
+		Box::new(dirigent::traits::FullIndex {})
 	}
 }
 
 #[test]
-fn test_1() {}
+fn test_1() {
+	use tokio::runtime::Runtime;
+
+	// Create the runtime
+	let rt = Runtime::new().unwrap();
+	let mut dirigent = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
+
+	dirigent.schedule(Box::new(TestProgram1 {})).unwrap();
+	dirigent.schedule(Box::new(TestProgram2 {})).unwrap();
+	let takt = dirigent.takt();
+
+	rt.block_on(async move {
+		dirigent.begin().await;
+	});
+}

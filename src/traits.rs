@@ -22,12 +22,34 @@ use futures::future::BoxFuture;
 
 use crate::{channel, envelope, envelope::Envelope};
 
+pub type ExitStatus = Result<(), ()>;
+
 pub trait Message: Clone + Send + Sync + 'static {
 	type Response: Send + Sync + 'static;
 }
 
-pub trait Index {
-	fn indexed(t: &Envelope) -> bool;
+pub trait Index: Send + Sync + 'static {
+	fn indexed(&self, t: &Envelope) -> bool;
+}
+
+impl Index for Box<dyn Index> {
+	fn indexed(&self, t: &Envelope) -> bool {
+		(**self).indexed(t)
+	}
+}
+
+pub struct FullIndex;
+impl Index for FullIndex {
+	fn indexed(&self, t: &Envelope) -> bool {
+		true
+	}
+}
+
+pub struct EmptyIndex;
+impl Index for EmptyIndex {
+	fn indexed(&self, t: &Envelope) -> bool {
+		false
+	}
 }
 
 pub trait LookUp {
@@ -37,35 +59,65 @@ pub trait LookUp {
 }
 
 #[async_trait::async_trait]
-pub trait Program: 'static + Sized + Send + Sync {
-	type Consumes: Index;
+pub trait Program: 'static + Send + Sync {
+	async fn start(self: Box<Self>, ctx: Box<dyn Context>) -> ExitStatus;
 
-	async fn start<C: Context>(self, ctx: C) -> C::Process;
+	fn index(&self) -> Box<dyn Index> {
+		Box::new(EmptyIndex {})
+	}
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
+impl Program for Box<dyn Program> {
+	async fn start(self: Box<Self>, ctx: Box<dyn Context>) -> ExitStatus {
+		Program::start(*self, ctx).await
+	}
+
+	fn index(&self) -> Box<dyn Index> {
+		(**self).index()
+	}
+}
+
+#[async_trait::async_trait]
 pub trait Context: Send + 'static {
-	type Process: Process;
-
-	fn create_process(&mut self) -> Self::Process;
-
 	async fn try_recv(&mut self) -> Result<Option<Envelope>, ()>;
 
 	async fn recv(&mut self) -> Result<Envelope, ()>;
 
-	async fn send(&mut self, envelope: impl Into<Envelope> + Send) -> Result<(), ()>;
+	async fn send(&mut self, envelope: Envelope) -> Result<(), ()>;
 
 	fn sender(&self) -> channel::Sender<Envelope>;
 
-	fn spawn_sub(&mut self, sub: impl Future<Output = ExitStatus> + Send + 'static);
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>);
 
-	fn spawn_sub_blocking(&mut self, sub: impl Future<Output = ExitStatus> + Send + 'static);
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>);
 }
 
-pub enum ExitStatus {
-	Error,
-	Finished,
-	Interrupted,
+#[async_trait::async_trait]
+impl Context for Box<dyn Context> {
+	async fn try_recv(&mut self) -> Result<Option<Envelope>, ()> {
+		(**self).try_recv().await
+	}
+
+	async fn recv(&mut self) -> Result<Envelope, ()> {
+		(**self).recv().await
+	}
+
+	async fn send(&mut self, envelope: Envelope) -> Result<(), ()> {
+		(**self).send(envelope).await
+	}
+
+	fn sender(&self) -> channel::Sender<Envelope> {
+		(**self).sender()
+	}
+
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		(**self).spawn_sub(sub)
+	}
+
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		(**self).spawn_sub_blocking(sub)
+	}
 }
 
 #[async_trait::async_trait]

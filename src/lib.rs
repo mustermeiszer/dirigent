@@ -1,3 +1,4 @@
+#![feature(box_into_inner)]
 // This file is part of dirigent.
 
 // Copyright (C) Frederik Gartenmeister.
@@ -16,6 +17,7 @@
 // limitations under the License.
 use core::{any::TypeId, marker::PhantomData};
 use std::{
+	ops::AddAssign,
 	pin::Pin,
 	sync::{Arc, Mutex},
 	task::{Context, Poll},
@@ -25,7 +27,7 @@ use futures::{future::BoxFuture, Future};
 
 use crate::{
 	envelope::Envelope,
-	traits::{ExitStatus, Index as _, Process as _, Process, Program, Spawner},
+	traits::{ExitStatus, Index as _, Index, Process as _, Process, Program, Spawner},
 };
 
 pub mod channel;
@@ -36,11 +38,11 @@ mod tests;
 pub mod traits;
 
 #[derive(Copy, Clone)]
-pub struct Pid(u64);
+pub struct Pid(usize);
 
 enum Command<P> {
 	Schedule {
-		program: P,
+		program: *const P,
 		return_pid: channel::Sender<Pid>,
 	},
 	Start(Pid),
@@ -52,30 +54,50 @@ enum Command<P> {
 	ForceShutdown,
 }
 
+unsafe impl<P: Send> Send for Command<P> {}
+
+impl<P> Clone for Command<P> {
+	fn clone(&self) -> Self {
+		match self {
+			Command::Schedule {
+				program,
+				return_pid,
+			} => Command::Schedule {
+				program: program.clone(),
+				return_pid: return_pid.clone(),
+			},
+			Command::Start(pid) => Command::Start(*pid),
+			Command::Preempt(pid) => Command::Start(*pid),
+			Command::FetchRunning(sender) => Command::FetchRunning(sender.clone()),
+			Command::Kill(pid) => Command::Kill(*pid),
+			Command::KillAll => Command::KillAll,
+			Command::Shutdown => Command::Shutdown,
+			Command::ForceShutdown => Command::ForceShutdown,
+		}
+	}
+}
+
 struct Instrum<P> {
 	pid: Pid,
-	programm: P,
+	program: P,
 }
 
-struct ActiveInstrum<P, I> {
+struct ActiveInstrum<I> {
 	pid: Pid,
 	instance: I,
+	index: Box<dyn Index>,
 	inbound: channel::Receiver<Envelope>,
-	_phantom: PhantomData<P>,
 }
 
-impl<P: Program, I: Process> ActiveInstrum<P, I> {
+impl<I: Process> ActiveInstrum<I> {
 	async fn produced(&self) -> Option<Envelope> {
 		// TODO: Handle error or make the method non result
-		self.inbound
-			.try_recv()
-			.await
-			.expect("Failed receiving from Process. Panic...")
+		self.inbound.recv().await.ok()
 	}
 
 	async fn try_consume(&self, envelope: Envelope) {
-		if <P as Program>::Consumes::indexed(&envelope) {
-			// TOD0: Fix error or make not result
+		if self.index.indexed(&envelope) {
+			// TODO: Fix error or make not result
 			self.instance
 				.send(envelope)
 				.await
@@ -87,10 +109,23 @@ impl<P: Program, I: Process> ActiveInstrum<P, I> {
 struct Dirigent<P: Program, Spawner> {
 	spawner: Spawner,
 	scheduled: Vec<Instrum<P>>,
-	running: Vec<ActiveInstrum<P, Instance>>,
+	running: Vec<ActiveInstrum<Instance>>,
 
 	takt_sender: channel::Sender<Command<P>>,
 	receiver: channel::Receiver<Command<P>>,
+	pid_allocation: PidAllocation,
+}
+
+struct PidAllocation(usize);
+impl PidAllocation {
+	pub fn new() -> PidAllocation {
+		PidAllocation(0)
+	}
+
+	pub fn pid(&mut self) -> Pid {
+		self.0.add_assign(1);
+		Pid(self.0)
+	}
 }
 
 impl<P: Program, S: Spawner> Dirigent<P, S> {
@@ -102,79 +137,125 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 			running: Vec::new(),
 			takt_sender,
 			receiver,
+			pid_allocation: PidAllocation::new(),
 		}
 	}
 
-	pub fn begin(mut self) -> Takt<P> {
+	pub fn schedule(&mut self, program: P) -> Result<(), ()> {
+		self.scheduled.push(Instrum {
+			pid: self.pid_allocation.pid(),
+			program,
+		});
+		Ok(())
+	}
+
+	pub fn takt(&self) -> Takt<P> {
+		Takt {
+			sender: self.takt_sender.clone(),
+		}
+	}
+
+	pub async fn begin(mut self) -> ExitStatus {
 		let Dirigent {
 			spawner,
 			receiver,
 			mut running,
 			takt_sender,
-			scheduled,
+			mut scheduled,
+			mut pid_allocation,
 		} = self;
 
-		let fut = Box::pin(async move {
-			loop {
-				// Serve commands first
-				if let Ok(cmd) = receiver.try_recv().await {
-					if let Some(cmd) = cmd {
-						match cmd {
-							Command::Schedule { .. } => {}
-							Command::FetchRunning(_) => {}
-							Command::Start(_) => {}
-							Command::Preempt(_) => {}
-							Command::Kill(_) => {}
-							Command::KillAll => {}
-							Command::ForceShutdown => {}
-							Command::Shutdown => break,
+		for mut instrum in scheduled {
+			let (sender_of_dirigent, recv_of_program) = channel::channel();
+			let (sender_of_program, recv_of_dirigent) = channel::channel();
+
+			let mut active_instrum = ActiveInstrum {
+				pid: instrum.pid,
+				instance: Instance {
+					state: State::Uninit,
+					inbound: sender_of_dirigent,
+				},
+				index: instrum.program.index(),
+				inbound: recv_of_dirigent,
+			};
+
+			let context = ContextImpl {
+				spawner: SubSpawner {
+					spawner: spawner.clone(),
+				},
+				recv: recv_of_program,
+				sender: sender_of_program,
+			};
+
+			let process = Box::new(instrum.program).start(Box::new(context));
+
+			active_instrum.instance.init(process);
+			active_instrum.instance.start(spawner.clone());
+
+			running.push(active_instrum);
+		}
+
+		let mut scheduled = Vec::new();
+
+		loop {
+			// Serve commands first
+			if let Ok(cmd) = receiver.try_recv().await {
+				if let Some(cmd) = cmd {
+					match cmd {
+						Command::Schedule {
+							program,
+							return_pid,
+						} => {
+							let program =
+								unsafe { Box::into_inner(Box::from_raw(program as *mut P)) };
+
+							scheduled.push(Instrum {
+								program,
+								pid: pid_allocation.pid(),
+							})
 						}
-					}
-				} else {
-					// Something is off now. We stop working
-					panic!("Dirigent can no longer receive commands. Panic...")
-				}
-
-				// Serve processes
-				//
-				// Collect messages first
-				let mut envelopes = Vec::with_capacity(running.len());
-				for active in &mut running {
-					let fut = active.produced();
-					if let Some(envelope) = fut.await {
-						envelopes.push(envelope)
+						Command::FetchRunning(_) => {}
+						Command::Start(pid) => {}
+						Command::Preempt(_) => {}
+						Command::Kill(_) => {}
+						Command::KillAll => {}
+						Command::ForceShutdown => {}
+						Command::Shutdown => break,
 					}
 				}
+			} else {
+				// Something is off now. We stop working
+				//panic!("Dirigent can no longer receive commands.
+				// Panic...")
+			}
 
-				// Distribute messages
-				for envelope in envelopes {
-					for active in &mut running {
-						let cloned_envelope = envelope.clone();
-						active.try_consume(cloned_envelope).await
-					}
+			// Serve processes
+			//
+			// Collect messages first
+			let mut envelopes = Vec::with_capacity(running.len());
+			for active in &mut running {
+				let fut = active.produced();
+				if let Some(envelope) = fut.await {
+					envelopes.push(envelope)
 				}
 			}
 
-			ExitStatus::Finished
-		});
-
-		spawner.spawn(fut);
-
-		/*
-		Takt {
-			sender: takt_sender,
-			_phantom: Default::default(),
+			// Distribute messages
+			for envelope in envelopes {
+				for active in &mut running {
+					let cloned_envelope = envelope.clone();
+					active.try_consume(cloned_envelope).await
+				}
+			}
 		}
 
-		 */
-
-		todo!()
+		Ok(())
 	}
 }
 
+#[derive(Clone)]
 struct Takt<P: Program> {
 	sender: channel::Sender<Command<P>>,
-	_phantom: PhantomData<P>,
 }
 
 impl<P: Program> Takt<P> {
@@ -182,7 +263,7 @@ impl<P: Program> Takt<P> {
 		let (send, mut recv) = channel::channel::<Pid>();
 		self.sender
 			.send(Command::Schedule {
-				program,
+				program: Box::into_raw(Box::new(program)),
 				return_pid: send,
 			})
 			.await?;
@@ -201,23 +282,21 @@ impl<P: Program> Takt<P> {
 	}
 
 	async fn preempt(&mut self, pid: Pid) -> Result<(), ()> {
-		todo!()
+		self.sender.send(Command::Preempt(pid)).await
 	}
 
 	async fn kill(&mut self, pid: Pid) -> Result<(), ()> {
-		todo!()
+		self.sender.send(Command::Kill(pid)).await
 	}
 
+	/*
 	async fn command(&mut self, cmd: Command<P>) -> Result<(), ()> {
-		todo!()
+		self.sender.send(Command::C(pid)).await
 	}
+	 */
 
 	async fn end(self) -> Result<(), ()> {
-		todo!()
-	}
-
-	async fn infinity(self) {
-		loop {}
+		self.sender.send(Command::Shutdown).await
 	}
 }
 
@@ -228,24 +307,14 @@ pub struct SubSpawner<Spawner> {
 pub struct ContextImpl<Spawner> {
 	spawner: SubSpawner<Spawner>,
 	recv: channel::Receiver<Envelope>,
-	inbound: channel::Sender<Envelope>,
 	sender: channel::Sender<Envelope>,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl<S> traits::Context for ContextImpl<S>
 where
 	S: Spawner,
 {
-	type Process = Instance;
-
-	fn create_process(&mut self) -> Instance {
-		Instance {
-			inbound: self.inbound.clone(),
-			state: State::Uninit,
-		}
-	}
-
 	async fn try_recv(&mut self) -> Result<Option<Envelope>, ()> {
 		self.recv.try_recv().await
 	}
@@ -254,9 +323,8 @@ where
 		self.recv.recv().await
 	}
 
-	async fn send(&mut self, envelope: impl Into<Envelope> + Send) -> Result<(), ()> {
-		let envelope = envelope.into();
-		let res = self.sender.send(envelope).await;
+	async fn send(&mut self, envelope: Envelope) -> Result<(), ()> {
+		let res = self.sender.try_send(envelope).await;
 		res
 	}
 
@@ -264,11 +332,11 @@ where
 		self.sender.clone()
 	}
 
-	fn spawn_sub(&mut self, sub: impl Future<Output = ExitStatus> + Send + 'static) {
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
 		todo!()
 	}
 
-	fn spawn_sub_blocking(&mut self, sub: impl Future<Output = ExitStatus> + Send + 'static) {
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
 		todo!()
 	}
 }
@@ -312,10 +380,10 @@ impl Future for SpawnedInstance {
 			match *state {
 				InstanceState::Running => this.inner.poll(cx),
 				InstanceState::Preempted => Poll::Pending,
-				InstanceState::Killed => Poll::Ready(ExitStatus::Interrupted),
+				InstanceState::Killed => Poll::Ready(Err(())),
 			}
 		} else {
-			Poll::Ready(ExitStatus::Error)
+			Poll::Ready(Err(()))
 		}
 	}
 }
