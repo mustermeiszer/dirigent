@@ -120,21 +120,6 @@ impl Context for Box<dyn Context> {
 	}
 }
 
-#[async_trait::async_trait]
-pub trait Process: Send + 'static {
-	fn init(&mut self, state: impl Future<Output = ExitStatus> + Send + 'static) -> Result<(), ()>;
-
-	fn initialized(&self) -> bool;
-
-	fn start(&mut self, spawner: impl Spawner);
-
-	async fn send(&self, msg: impl Into<Envelope> + Send) -> Result<(), ()>;
-
-	async fn preempt(&mut self) -> Result<(), ()>;
-
-	async fn kill(&mut self) -> Result<(), ()>;
-}
-
 pub trait Spawner: Clone + Send + Sync + 'static {
 	/// Spawn the given blocking future.
 	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static);

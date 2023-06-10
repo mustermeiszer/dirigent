@@ -27,7 +27,7 @@ use futures::{future::BoxFuture, Future};
 
 use crate::{
 	envelope::Envelope,
-	traits::{ExitStatus, Index as _, Index, Process as _, Process, Program, Spawner},
+	traits::{ExitStatus, Index as _, Index, Program, Spawner},
 };
 
 pub mod channel;
@@ -82,34 +82,144 @@ struct Instrum<P> {
 	program: P,
 }
 
-struct ActiveInstrum<I> {
-	pid: Pid,
-	instance: I,
-	index: Box<dyn Index>,
-	inbound: channel::Receiver<Envelope>,
+impl<P: Program> Instrum<P> {
+	fn play<S: Spawner>(self, spawner: &S) -> ActiveInstrum {
+		let Instrum { pid, program } = self;
+
+		let (sender_of_dirigent, recv_of_program) = channel::channel();
+		let (sender_of_program, recv_of_dirigent) = channel::channel();
+		let index = program.index();
+
+		let context = ContextImpl {
+			spawner: SubSpawner {
+				spawner: spawner.clone(),
+			},
+			recv: recv_of_program,
+			sender: sender_of_program,
+		};
+
+		let process = Box::new(program).start(Box::new(context));
+
+		let mut active = ActiveInstrum {
+			pid,
+			state: State::Init(sync_wrapper::SyncWrapper::new(process)),
+			to_instance: sender_of_dirigent,
+			index,
+			from_instance: recv_of_dirigent,
+		};
+
+		active.start(spawner);
+		active
+	}
 }
 
-impl<I: Process> ActiveInstrum<I> {
+struct ActiveInstrum {
+	pid: Pid,
+	state: State,
+	index: Box<dyn Index>,
+	to_instance: channel::Sender<Envelope>,
+	from_instance: channel::Receiver<Envelope>,
+}
+
+impl ActiveInstrum {
 	async fn produced(&self) -> Option<Envelope> {
 		// TODO: Handle error or make the method non result
-		self.inbound.recv().await.ok()
+		self.from_instance.try_recv().await.ok().flatten()
 	}
 
 	async fn try_consume(&self, envelope: Envelope) {
 		if self.index.indexed(&envelope) {
 			// TODO: Fix error or make not result
-			self.instance
-				.send(envelope)
+			self.to_instance
+				.try_send(envelope)
 				.await
 				.expect("Sending to instance failed. Panic...")
 		}
+	}
+
+	fn initialized(&self) -> bool {
+		match &self.state {
+			State::Uninit | State::Running(_) | State::Preempted(_) | State::Exited => false,
+			State::Init(_) => true,
+		}
+	}
+
+	fn alive(&self) -> bool {
+		match &self.state {
+			State::Uninit | State::Init(_) | State::Exited => false,
+			State::Running(_) | State::Preempted(_) => true,
+		}
+	}
+
+	fn start(&mut self, spawner: &impl Spawner) {
+		if self.initialized() {
+			let mut state = State::Uninit;
+			core::mem::swap(&mut self.state, &mut state);
+
+			if let State::Init(state) = state {
+				let instance_state = Arc::new(Mutex::new(InstanceState::Running));
+
+				let spawned_instance = SpawnedInstance {
+					inner: state.into_inner(),
+					instance_state: instance_state.clone(),
+				};
+				self.state = State::Running(RefSpawnedInstance(instance_state));
+				spawner.spawn(spawned_instance)
+			} else {
+				unreachable!("Control flow prohibits this state.")
+			}
+		} else {
+			// TODO: Error here
+		}
+	}
+
+	async fn send(&self, msg: impl Into<Envelope> + Send) -> Result<(), ()> {
+		let env: Envelope = msg.into();
+
+		// TODO: Might wanna remove the program if not alive?
+		if self.alive() {
+			self.to_instance.send(env).await
+		} else {
+			Ok(())
+		}
+	}
+
+	// TODO: Research race-conditions
+	async fn preempt(&mut self) -> Result<(), ()> {
+		let spawned = match &self.state {
+			State::Uninit | State::Init(_) | State::Preempted(_) | State::Exited => return Err(()),
+			State::Running(spawned) => {
+				let mut l = spawned.0.lock().map_err(|_| ())?;
+				*l = InstanceState::Preempted;
+
+				spawned
+			}
+		};
+
+		self.state = State::Preempted(spawned.clone());
+
+		Ok(())
+	}
+
+	// TODO: Research race-conditions
+	async fn kill(&mut self) -> Result<(), ()> {
+		match &self.state {
+			State::Uninit | State::Init(_) | State::Exited => return Err(()),
+			State::Running(spawned) | State::Preempted(spawned) => {
+				let mut l = spawned.0.lock().map_err(|_| ())?;
+				*l = InstanceState::Killed;
+			}
+		}
+		self.state = State::Exited;
+
+		Ok(())
 	}
 }
 
 struct Dirigent<P: Program, Spawner> {
 	spawner: Spawner,
 	scheduled: Vec<Instrum<P>>,
-	running: Vec<ActiveInstrum<Instance>>,
+	running: Vec<ActiveInstrum>,
 
 	takt_sender: channel::Sender<Command<P>>,
 	receiver: channel::Receiver<Command<P>>,
@@ -166,32 +276,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 		} = self;
 
 		for mut instrum in scheduled {
-			let (sender_of_dirigent, recv_of_program) = channel::channel();
-			let (sender_of_program, recv_of_dirigent) = channel::channel();
-
-			let mut active_instrum = ActiveInstrum {
-				pid: instrum.pid,
-				instance: Instance {
-					state: State::Uninit,
-					inbound: sender_of_dirigent,
-				},
-				index: instrum.program.index(),
-				inbound: recv_of_dirigent,
-			};
-
-			let context = ContextImpl {
-				spawner: SubSpawner {
-					spawner: spawner.clone(),
-				},
-				recv: recv_of_program,
-				sender: sender_of_program,
-			};
-
-			let process = Box::new(instrum.program).start(Box::new(context));
-
-			active_instrum.instance.init(process);
-			active_instrum.instance.start(spawner.clone());
-
+			let active_instrum = instrum.play(&spawner);
 			running.push(active_instrum);
 		}
 
@@ -349,10 +434,8 @@ pub enum State {
 	Exited,
 }
 
-pub struct Instance {
-	state: State,
-	inbound: channel::Sender<Envelope>,
-}
+#[derive(Clone)]
+pub struct RefSpawnedInstance(Arc<Mutex<InstanceState>>);
 
 #[pin_project::pin_project]
 struct SpawnedInstance {
@@ -368,9 +451,6 @@ pub enum InstanceState {
 	Killed,
 }
 
-#[derive(Clone)]
-pub struct RefSpawnedInstance(Arc<Mutex<InstanceState>>);
-
 impl Future for SpawnedInstance {
 	type Output = ExitStatus;
 
@@ -385,107 +465,5 @@ impl Future for SpawnedInstance {
 		} else {
 			Poll::Ready(Err(()))
 		}
-	}
-}
-
-impl Instance {
-	fn running(&self) -> bool {
-		match &self.state {
-			State::Uninit | State::Init(_) | State::Preempted(_) | State::Exited => false,
-			State::Running(_) => true,
-		}
-	}
-
-	fn alive(&self) -> bool {
-		match &self.state {
-			State::Uninit | State::Init(_) | State::Exited => false,
-			State::Running(_) | State::Preempted(_) => true,
-		}
-	}
-}
-
-#[async_trait::async_trait]
-impl Process for Instance {
-	fn init(&mut self, state: impl Future<Output = ExitStatus> + Send + 'static) -> Result<(), ()> {
-		match self.state {
-			State::Uninit => {
-				let boxed: Pin<Box<dyn Future<Output = ExitStatus> + Send + 'static>> =
-					Box::pin(state);
-				self.state = State::Init(sync_wrapper::SyncWrapper::new(boxed));
-				Ok(())
-			}
-			State::Init(_) | State::Running(_) | State::Preempted(_) | State::Exited => Err(()),
-		}
-	}
-
-	fn initialized(&self) -> bool {
-		match &self.state {
-			State::Uninit | State::Running(_) | State::Preempted(_) | State::Exited => false,
-			State::Init(_) => true,
-		}
-	}
-
-	fn start(&mut self, spawner: impl Spawner) {
-		if self.initialized() {
-			let mut state = State::Uninit;
-			core::mem::swap(&mut self.state, &mut state);
-
-			if let State::Init(state) = state {
-				let instance_state = Arc::new(Mutex::new(InstanceState::Running));
-
-				let spawned_instance = SpawnedInstance {
-					inner: state.into_inner(),
-					instance_state: instance_state.clone(),
-				};
-				self.state = State::Running(RefSpawnedInstance(instance_state));
-				spawner.spawn(spawned_instance)
-			} else {
-				unreachable!("Control flow prohibits this state.")
-			}
-		} else {
-			// TODO: Error here
-		}
-	}
-
-	async fn send(&self, msg: impl Into<Envelope> + Send) -> Result<(), ()> {
-		let env: Envelope = msg.into();
-
-		// TODO: Might wanna remove the program if not alive?
-		if self.alive() {
-			self.inbound.send(env).await
-		} else {
-			Ok(())
-		}
-	}
-
-	// TODO: Research race-conditions
-	async fn preempt(&mut self) -> Result<(), ()> {
-		let spawned = match &self.state {
-			State::Uninit | State::Init(_) | State::Preempted(_) | State::Exited => return Err(()),
-			State::Running(spawned) => {
-				let mut l = spawned.0.lock().map_err(|_| ())?;
-				*l = InstanceState::Preempted;
-
-				spawned
-			}
-		};
-
-		self.state = State::Preempted(spawned.clone());
-
-		Ok(())
-	}
-
-	// TODO: Research race-conditions
-	async fn kill(&mut self) -> Result<(), ()> {
-		match &self.state {
-			State::Uninit | State::Init(_) | State::Exited => return Err(()),
-			State::Running(spawned) | State::Preempted(spawned) => {
-				let mut l = spawned.0.lock().map_err(|_| ())?;
-				*l = InstanceState::Killed;
-			}
-		}
-		self.state = State::Exited;
-
-		Ok(())
 	}
 }
