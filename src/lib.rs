@@ -37,7 +37,7 @@ pub mod spawner;
 mod tests;
 pub mod traits;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Pid(usize);
 
 enum Command<P> {
@@ -92,7 +92,7 @@ impl<P: Program> Instrum<P> {
 
 		let context = ContextImpl {
 			spawner: SubSpawner {
-				spawner: spawner.clone(),
+				spawner: spawner.handle(),
 			},
 			recv: recv_of_program,
 			sender: sender_of_program,
@@ -232,6 +232,10 @@ impl PidAllocation {
 		PidAllocation(0)
 	}
 
+	pub fn last(&self) -> Pid {
+		Pid(self.0)
+	}
+
 	pub fn pid(&mut self) -> Pid {
 		self.0.add_assign(1);
 		Pid(self.0)
@@ -297,10 +301,20 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 							scheduled.push(Instrum {
 								program,
 								pid: pid_allocation.pid(),
-							})
+							});
+
+							return_pid.try_send(pid_allocation.last()).await.unwrap();
 						}
 						Command::FetchRunning(_) => {}
-						Command::Start(pid) => {}
+						Command::Start(pid) => {
+							if let Some(index) =
+								scheduled.iter().position(|instrum| instrum.pid == pid)
+							{
+								running.push(scheduled.swap_remove(index).play(&spawner));
+							} else {
+								// TODO: Trace warning here
+							}
+						}
 						Command::Preempt(_) => {}
 						Command::Kill(_) => {}
 						Command::KillAll => {}
@@ -319,8 +333,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 			// Collect messages first
 			let mut envelopes = Vec::with_capacity(running.len());
 			for active in &mut running {
-				let fut = active.produced();
-				if let Some(envelope) = fut.await {
+				if let Some(envelope) = active.produced().await {
 					envelopes.push(envelope)
 				}
 			}
@@ -343,17 +356,23 @@ struct Takt<P: Program> {
 	sender: channel::Sender<Command<P>>,
 }
 
+unsafe impl<P: Program> Send for Takt<P> {}
+unsafe impl<P: Program> Sync for Takt<P> {}
+
 impl<P: Program> Takt<P> {
 	async fn schedule(&mut self, program: P) -> Result<Pid, ()> {
 		let (send, mut recv) = channel::channel::<Pid>();
-		self.sender
-			.send(Command::Schedule {
-				program: Box::into_raw(Box::new(program)),
-				return_pid: send,
-			})
-			.await?;
+		let cmd = Takt::schedule_cmd(send, program);
+		self.sender.send(cmd).await?;
 
 		recv.recv().await
+	}
+
+	fn schedule_cmd(send: channel::Sender<Pid>, program: P) -> Command<P> {
+		Command::Schedule {
+			program: Box::into_raw(Box::new(program)),
+			return_pid: send,
+		}
 	}
 
 	async fn schedule_and_start(&mut self, program: P) -> Result<Pid, ()> {

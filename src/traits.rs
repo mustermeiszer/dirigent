@@ -68,7 +68,7 @@ pub trait Program: 'static + Send + Sync {
 }
 
 #[async_trait::async_trait]
-impl Program for Box<dyn Program> {
+impl<'a> Program for Box<dyn Program + 'a> {
 	async fn start(self: Box<Self>, ctx: Box<dyn Context>) -> ExitStatus {
 		Program::start(*self, ctx).await
 	}
@@ -120,9 +120,13 @@ impl Context for Box<dyn Context> {
 	}
 }
 
-pub trait Spawner: Clone + Send + Sync + 'static {
+pub trait Spawner: Send + Sync + 'static {
+	type Handle: Spawner;
+
 	/// Spawn the given blocking future.
 	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static);
 	/// Spawn the given non-blocking future.
 	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static);
+	/// Get a handle to this spawner, allowing to spawn stuff again.
+	fn handle(&self) -> Self::Handle;
 }

@@ -20,11 +20,33 @@ use futures::future::Future;
 use crate::traits::{ExitStatus, Spawner};
 
 impl Spawner for tokio::runtime::Handle {
+	type Handle = Self;
+
 	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
 		self.spawn_blocking(|| future);
 	}
 
 	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
 		self.spawn(future);
+	}
+
+	fn handle(&self) -> Self::Handle {
+		self.clone()
+	}
+}
+
+impl Spawner for tokio::runtime::Runtime {
+	type Handle = tokio::runtime::Handle;
+
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawn_blocking(|| future);
+	}
+
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawn(future);
+	}
+
+	fn handle(&self) -> Self::Handle {
+		self.handle().clone()
 	}
 }

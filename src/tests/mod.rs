@@ -3,6 +3,8 @@
 // Copyright (C) Frederik Gartenmeister.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::thread;
+
 use tokio::runtime::Handle;
 
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +21,7 @@ use tokio::runtime::Handle;
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
-	traits::{Context, ExitStatus, Index, Process, Program},
+	traits::{Context, ExitStatus, Index, Program},
 };
 
 #[derive(Clone)]
@@ -88,7 +90,36 @@ fn test_1() {
 
 	dirigent.schedule(Box::new(TestProgram1 {})).unwrap();
 	dirigent.schedule(Box::new(TestProgram2 {})).unwrap();
-	let takt = dirigent.takt();
+	let mut takt = dirigent.takt();
+	let p = TestProgram2 {};
+	let p = Box::new(p);
+
+	rt.spawn(async move {
+		let mut takt = takt;
+		takt.schedule_and_start(p).await;
+	});
+
+	rt.block_on(async move {
+		dirigent.begin().await;
+	});
+}
+
+#[test]
+fn test_2() {
+	use tokio::runtime::Runtime;
+
+	// Create the runtime
+	let rt = Runtime::new().unwrap();
+	let mut dirigent = dirigent::Dirigent::<TestProgram2, _>::new(rt.handle().clone());
+
+	dirigent.schedule(TestProgram2 {}).unwrap();
+	let mut takt = dirigent.takt();
+	let p = TestProgram2 {};
+
+	rt.spawn(async move {
+		let mut takt = takt;
+		takt.schedule_and_start(p).await;
+	});
 
 	rt.block_on(async move {
 		dirigent.begin().await;
