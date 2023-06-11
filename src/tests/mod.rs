@@ -110,12 +110,13 @@ fn test_2() {
 
 	// Create the runtime
 	let rt = Runtime::new().unwrap();
-	let mut dirigent = dirigent::Dirigent::<TestProgram2, _>::new(rt.handle().clone());
+	let mut dirigent = dirigent::Dirigent::<TestProgram2, _>::new(rt);
 
 	dirigent.schedule(TestProgram2 {}).unwrap();
 	let mut takt = dirigent.takt();
 	let p = TestProgram2 {};
 
+	let rt = Runtime::new().unwrap();
 	rt.spawn(async move {
 		let mut takt = takt;
 		takt.schedule_and_start(p).await;

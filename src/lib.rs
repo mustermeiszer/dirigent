@@ -1,4 +1,3 @@
-#![feature(box_into_inner)]
 // This file is part of dirigent.
 
 // Copyright (C) Frederik Gartenmeister.
@@ -295,8 +294,22 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 							program,
 							return_pid,
 						} => {
-							let program =
-								unsafe { Box::into_inner(Box::from_raw(program as *mut P)) };
+							// TODO: Verify safety assumptions...
+
+							// SAFETY:
+							//  - it is impossible to create an instance of `enum Command` outside
+							//    of this repository
+							//  - the `struct Takt` takes an owner value of `P: Program`
+							//      - the owned type is boxed and leaked then
+							//  - `trait Program` is only implemented for `Box<dyn Program + 'a>`
+							//    and not not for any other smart pointer
+							//  - We NEVER clone a command
+							//  - Channels ALWAYS assure a message is only delivered once over a
+							//    channel
+							//
+							//  Hence, it is safe for us to regard the pointer as valid and
+							// dereference it here
+							let program = unsafe { *Box::from_raw(program as *mut P) };
 
 							scheduled.push(Instrum {
 								program,
@@ -428,8 +441,7 @@ where
 	}
 
 	async fn send(&mut self, envelope: Envelope) -> Result<(), ()> {
-		let res = self.sender.try_send(envelope).await;
-		res
+		self.sender.try_send(envelope).await
 	}
 
 	fn sender(&self) -> channel::Sender<Envelope> {
