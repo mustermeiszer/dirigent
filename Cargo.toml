@@ -1,0 +1,8 @@
+[package]
+name = "dirigent"
+authors = ["Frederik Gartenmeister <mustermeiszer@posteo.de>"]
+edition = "2021"
+repository = "https://github.com/mustermeiszer/dirigent.git"
+version = "0.1.0"
+
+[dependencies]
