@@ -15,14 +15,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::marker::PhantomData;
-
 const DEFAULT_CHANNEL_SIZE: usize = 512;
 
 pub enum Error {}
 
 pub mod mpsc {
-	use super::{Error, DEFAULT_CHANNEL_SIZE};
+	use super::DEFAULT_CHANNEL_SIZE;
 
 	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
@@ -70,7 +68,7 @@ pub mod mpsc {
 }
 
 pub mod mpmc {
-	use super::{Error, DEFAULT_CHANNEL_SIZE};
+	use super::DEFAULT_CHANNEL_SIZE;
 
 	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
@@ -119,8 +117,6 @@ pub mod mpmc {
 }
 
 pub mod oneshot {
-	use super::{Error, DEFAULT_CHANNEL_SIZE};
-
 	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, 1>()
 	}

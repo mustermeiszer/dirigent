@@ -14,7 +14,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use core::{any::TypeId, marker::PhantomData};
+
+#![allow(dead_code)]
+
+// TODO: Remove std dependency
 use std::{
 	ops::AddAssign,
 	pin::Pin,
@@ -26,7 +29,7 @@ use futures::{future::BoxFuture, Future};
 
 use crate::{
 	envelope::Envelope,
-	traits::{ExitStatus, Index as _, Index, Program, Spawner},
+	traits::{ExitStatus, Index, Program, Spawner},
 };
 
 pub mod channel;
@@ -268,17 +271,17 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 		}
 	}
 
-	pub async fn begin(mut self) -> ExitStatus {
+	pub async fn begin(self) -> ExitStatus {
 		let Dirigent {
 			spawner,
 			receiver,
 			mut running,
-			takt_sender,
-			mut scheduled,
+			takt_sender: _takt_sender,
+			scheduled,
 			mut pid_allocation,
 		} = self;
 
-		for mut instrum in scheduled {
+		for instrum in scheduled {
 			let active_instrum = instrum.play(&spawner);
 			running.push(active_instrum);
 		}
@@ -374,7 +377,7 @@ unsafe impl<P: Program> Sync for Takt<P> {}
 
 impl<P: Program> Takt<P> {
 	async fn schedule(&mut self, program: P) -> Result<Pid, ()> {
-		let (send, mut recv) = channel::mpsc::channel::<Pid>();
+		let (send, recv) = channel::mpsc::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: Box::into_raw(Box::new(program)),
 			return_pid: send,
@@ -444,11 +447,11 @@ where
 		self.sender.clone()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+	fn spawn_sub(&mut self, _sub: BoxFuture<'static, ExitStatus>) {
 		todo!()
 	}
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+	fn spawn_sub_blocking(&mut self, _sub: BoxFuture<'static, ExitStatus>) {
 		todo!()
 	}
 }

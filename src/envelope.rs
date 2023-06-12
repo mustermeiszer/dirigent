@@ -21,7 +21,7 @@ use std::{any::TypeId, sync::Mutex};
 // TODO: This makes this crate wasm incompatible
 type Arc<T> = std::sync::Arc<T>;
 
-use crate::{channel, traits, traits::Message};
+use crate::{channel, traits::Message};
 
 #[derive(Debug)]
 pub enum ResponseError {
@@ -33,7 +33,7 @@ pub enum ResponseError {
 struct Responder<M: Message> {
 	sender: channel::mpsc::Sender<M::Response>,
 	answers: Arc<Mutex<u32>>,
-	min_answers: u32,
+	_min_answers: u32,
 	max_answers: u32,
 }
 
@@ -91,7 +91,7 @@ impl<M: Message> Letter<M> {
 		self.responder = Some(Responder {
 			sender,
 			answers: Arc::new(Mutex::new(0)),
-			min_answers: min,
+			_min_answers: min,
 			max_answers: max,
 		});
 

@@ -15,12 +15,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::{any::Any, future::Future};
-use std::pin::Pin;
+use core::future::Future;
 
 use futures::future::BoxFuture;
 
-use crate::{channel, envelope, envelope::Envelope};
+use crate::{channel, envelope::Envelope};
 
 pub type ExitStatus = Result<(), ()>;
 
@@ -40,14 +39,14 @@ impl Index for Box<dyn Index> {
 
 pub struct FullIndex;
 impl Index for FullIndex {
-	fn indexed(&self, t: &Envelope) -> bool {
+	fn indexed(&self, _t: &Envelope) -> bool {
 		true
 	}
 }
 
 pub struct EmptyIndex;
 impl Index for EmptyIndex {
-	fn indexed(&self, t: &Envelope) -> bool {
+	fn indexed(&self, _t: &Envelope) -> bool {
 		false
 	}
 }
