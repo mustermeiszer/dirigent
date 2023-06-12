@@ -31,7 +31,7 @@ pub enum ResponseError {
 
 #[derive(Clone)]
 struct Responder<M: Message> {
-	sender: channel::Sender<M::Response>,
+	sender: channel::mpsc::Sender<M::Response>,
 	answers: Arc<Mutex<u32>>,
 	min_answers: u32,
 	max_answers: u32,
@@ -81,12 +81,12 @@ impl<M: Message> Letter<M> {
 		}
 	}
 
-	pub fn expect_response(&mut self) -> channel::Receiver<M::Response> {
+	pub fn expect_response(&mut self) -> channel::mpsc::Receiver<M::Response> {
 		self.expect_responses(1, 1)
 	}
 
-	pub fn expect_responses(&mut self, min: u32, max: u32) -> channel::Receiver<M::Response> {
-		let (sender, receiver) = channel::channel::<M::Response>();
+	pub fn expect_responses(&mut self, min: u32, max: u32) -> channel::mpsc::Receiver<M::Response> {
+		let (sender, receiver) = channel::mpsc::channel::<M::Response>();
 
 		self.responder = Some(Responder {
 			sender,

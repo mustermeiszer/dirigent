@@ -19,46 +19,140 @@ use std::marker::PhantomData;
 
 const DEFAULT_CHANNEL_SIZE: usize = 512;
 
-pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
-	channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
-}
+pub enum Error {}
 
-pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
-	let (inner_sender, inner_recv) = flume::bounded::<T>(SIZE);
+pub mod mpsc {
+	use super::{Error, DEFAULT_CHANNEL_SIZE};
 
-	(
-		Sender {
-			inner: inner_sender,
-		},
-		Receiver { inner: inner_recv },
-	)
-}
-
-#[derive(Clone)]
-pub struct Sender<T: Send> {
-	inner: flume::Sender<T>,
-}
-
-impl<T: Send> Sender<T> {
-	pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
-		self.inner.send_async(t.into()).await.map_err(|_| ())
+	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
 	}
 
-	pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
-		self.inner.try_send(t.into()).map_err(|_| ())
+	pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+		let (inner_sender, inner_recv) = flume::bounded::<T>(SIZE);
+
+		(
+			Sender {
+				inner: inner_sender,
+			},
+			Receiver { inner: inner_recv },
+		)
+	}
+
+	#[derive(Clone)]
+	pub struct Sender<T: Send> {
+		inner: flume::Sender<T>,
+	}
+
+	impl<T: Send> Sender<T> {
+		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
+			self.inner.send_async(t.into()).await.map_err(|_| ())
+		}
+
+		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
+			self.inner.try_send(t.into()).map_err(|_| ())
+		}
+	}
+
+	pub struct Receiver<T: Send> {
+		inner: flume::Receiver<T>,
+	}
+
+	impl<T: Send> Receiver<T> {
+		pub async fn recv(&self) -> Result<T, ()> {
+			self.inner.recv_async().await.map_err(|_| ())
+		}
+
+		pub async fn try_recv(&self) -> Result<Option<T>, ()> {
+			self.inner.try_recv().map_err(|_| ()).map(|t| Some(t))
+		}
 	}
 }
 
-pub struct Receiver<T: Send> {
-	inner: flume::Receiver<T>,
-}
+pub mod mpmc {
+	use super::{Error, DEFAULT_CHANNEL_SIZE};
 
-impl<T: Send> Receiver<T> {
-	pub async fn recv(&self) -> Result<T, ()> {
-		self.inner.recv_async().await.map_err(|_| ())
+	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
 	}
 
-	pub async fn try_recv(&self) -> Result<Option<T>, ()> {
-		self.inner.try_recv().map_err(|_| ()).map(|t| Some(t))
+	pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+		let (inner_sender, inner_recv) = crossbeam::channel::bounded::<T>(SIZE);
+
+		(
+			Sender {
+				inner: inner_sender,
+			},
+			Receiver { inner: inner_recv },
+		)
+	}
+
+	#[derive(Clone)]
+	pub struct Sender<T: Send> {
+		inner: crossbeam::channel::Sender<T>,
+	}
+
+	impl<T: Send> Sender<T> {
+		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
+			self.inner.send(t.into()).map_err(|_| ())
+		}
+
+		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
+			self.inner.try_send(t.into()).map_err(|_| ())
+		}
+	}
+
+	#[derive(Clone)]
+	pub struct Receiver<T: Send> {
+		inner: crossbeam::channel::Receiver<T>,
+	}
+
+	impl<T: Send> Receiver<T> {
+		pub async fn recv(&self) -> Result<T, ()> {
+			self.inner.recv().map_err(|_| ())
+		}
+
+		pub async fn try_recv(&self) -> Result<Option<T>, ()> {
+			self.inner.try_recv().map_err(|_| ()).map(|t| Some(t))
+		}
+	}
+}
+
+pub mod oneshot {
+	use super::{Error, DEFAULT_CHANNEL_SIZE};
+
+	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+		channel_sized::<T, 1>()
+	}
+
+	fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+		let (inner_sender, inner_recv) = flume::bounded::<T>(SIZE);
+
+		(
+			Sender {
+				inner: inner_sender,
+			},
+			Receiver { inner: inner_recv },
+		)
+	}
+
+	pub struct Sender<T: Send> {
+		inner: flume::Sender<T>,
+	}
+
+	impl<T: Send> Sender<T> {
+		pub async fn send(self, t: impl Into<T> + Send) -> Result<(), ()> {
+			self.inner.send_async(t.into()).await.map_err(|_| ())
+		}
+	}
+
+	pub struct Receiver<T: Send> {
+		inner: flume::Receiver<T>,
+	}
+
+	impl<T: Send> Receiver<T> {
+		pub async fn recv(&self) -> Result<T, ()> {
+			self.inner.recv_async().await.map_err(|_| ())
+		}
 	}
 }

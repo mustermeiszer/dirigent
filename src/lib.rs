@@ -42,11 +42,11 @@ pub struct Pid(usize);
 enum Command<P> {
 	Schedule {
 		program: *const P,
-		return_pid: channel::Sender<Pid>,
+		return_pid: channel::mpsc::Sender<Pid>,
 	},
 	Start(Pid),
 	Preempt(Pid),
-	FetchRunning(channel::Sender<Vec<Pid>>),
+	FetchRunning(channel::mpsc::Sender<Vec<Pid>>),
 	Kill(Pid),
 	KillAll,
 	Shutdown,
@@ -85,8 +85,8 @@ impl<P: Program> Instrum<P> {
 	fn play<S: Spawner>(self, spawner: &S) -> ActiveInstrum {
 		let Instrum { pid, program } = self;
 
-		let (sender_of_dirigent, recv_of_program) = channel::channel();
-		let (sender_of_program, recv_of_dirigent) = channel::channel();
+		let (sender_of_dirigent, recv_of_program) = channel::mpsc::channel();
+		let (sender_of_program, recv_of_dirigent) = channel::mpsc::channel();
 		let index = program.index();
 
 		let context = ContextImpl {
@@ -116,8 +116,8 @@ struct ActiveInstrum {
 	pid: Pid,
 	state: State,
 	index: Box<dyn Index>,
-	to_instance: channel::Sender<Envelope>,
-	from_instance: channel::Receiver<Envelope>,
+	to_instance: channel::mpsc::Sender<Envelope>,
+	from_instance: channel::mpsc::Receiver<Envelope>,
 }
 
 impl ActiveInstrum {
@@ -220,8 +220,8 @@ struct Dirigent<P: Program, Spawner> {
 	scheduled: Vec<Instrum<P>>,
 	running: Vec<ActiveInstrum>,
 
-	takt_sender: channel::Sender<Command<P>>,
-	receiver: channel::Receiver<Command<P>>,
+	takt_sender: channel::mpsc::Sender<Command<P>>,
+	receiver: channel::mpsc::Receiver<Command<P>>,
 	pid_allocation: PidAllocation,
 }
 
@@ -243,7 +243,7 @@ impl PidAllocation {
 
 impl<P: Program, S: Spawner> Dirigent<P, S> {
 	pub fn new(spawner: S) -> Self {
-		let (takt_sender, receiver) = channel::channel();
+		let (takt_sender, receiver) = channel::mpsc::channel();
 		Dirigent {
 			spawner,
 			scheduled: Vec::new(),
@@ -316,7 +316,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 								pid: pid_allocation.pid(),
 							});
 
-							return_pid.try_send(pid_allocation.last()).await.unwrap();
+							return_pid.send(pid_allocation.last()).await.unwrap();
 						}
 						Command::FetchRunning(_) => {}
 						Command::Start(pid) => {
@@ -366,7 +366,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 
 #[derive(Clone)]
 struct Takt<P: Program> {
-	sender: channel::Sender<Command<P>>,
+	sender: channel::mpsc::Sender<Command<P>>,
 }
 
 unsafe impl<P: Program> Send for Takt<P> {}
@@ -374,18 +374,14 @@ unsafe impl<P: Program> Sync for Takt<P> {}
 
 impl<P: Program> Takt<P> {
 	async fn schedule(&mut self, program: P) -> Result<Pid, ()> {
-		let (send, mut recv) = channel::channel::<Pid>();
-		let cmd = Takt::schedule_cmd(send, program);
+		let (send, mut recv) = channel::mpsc::channel::<Pid>();
+		let cmd = Command::Schedule {
+			program: Box::into_raw(Box::new(program)),
+			return_pid: send,
+		};
 		self.sender.send(cmd).await?;
 
 		recv.recv().await
-	}
-
-	fn schedule_cmd(send: channel::Sender<Pid>, program: P) -> Command<P> {
-		Command::Schedule {
-			program: Box::into_raw(Box::new(program)),
-			return_pid: send,
-		}
 	}
 
 	async fn schedule_and_start(&mut self, program: P) -> Result<Pid, ()> {
@@ -423,8 +419,8 @@ pub struct SubSpawner<Spawner> {
 
 pub struct ContextImpl<Spawner> {
 	spawner: SubSpawner<Spawner>,
-	recv: channel::Receiver<Envelope>,
-	sender: channel::Sender<Envelope>,
+	recv: channel::mpsc::Receiver<Envelope>,
+	sender: channel::mpsc::Sender<Envelope>,
 }
 
 #[async_trait::async_trait]
@@ -444,7 +440,7 @@ where
 		self.sender.try_send(envelope).await
 	}
 
-	fn sender(&self) -> channel::Sender<Envelope> {
+	fn sender(&self) -> channel::mpsc::Sender<Envelope> {
 		self.sender.clone()
 	}
 

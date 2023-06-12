@@ -86,7 +86,7 @@ pub trait Context: Send + 'static {
 
 	async fn send(&mut self, envelope: Envelope) -> Result<(), ()>;
 
-	fn sender(&self) -> channel::Sender<Envelope>;
+	fn sender(&self) -> channel::mpsc::Sender<Envelope>;
 
 	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>);
 
@@ -107,7 +107,7 @@ impl Context for Box<dyn Context> {
 		(**self).send(envelope).await
 	}
 
-	fn sender(&self) -> channel::Sender<Envelope> {
+	fn sender(&self) -> channel::mpsc::Sender<Envelope> {
 		(**self).sender()
 	}
 
