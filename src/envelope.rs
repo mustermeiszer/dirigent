@@ -124,7 +124,7 @@ impl From<ResponseError> for EnvelopeError {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Envelope {
 	inner: Arc<Box<dyn Any + Send + Sync>>,
 	read: Arc<Mutex<bool>>,

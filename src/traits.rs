@@ -16,6 +16,7 @@
 // limitations under the License.
 
 use core::future::Future;
+use std::fmt::Debug;
 
 use futures::future::BoxFuture;
 
@@ -58,7 +59,7 @@ pub trait LookUp {
 }
 
 #[async_trait::async_trait]
-pub trait Program: 'static + Send + Sync {
+pub trait Program: 'static + Send + Sync + Debug {
 	async fn start(self: Box<Self>, ctx: Box<dyn Context>) -> ExitStatus;
 
 	fn index(&self) -> Box<dyn Index> {

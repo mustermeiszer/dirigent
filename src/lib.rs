@@ -39,9 +39,10 @@ pub mod spawner;
 mod tests;
 pub mod traits;
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Pid(usize);
 
+#[derive(Debug)]
 enum Command<P> {
 	Schedule {
 		program: *const P,
@@ -175,7 +176,10 @@ impl ActiveInstrum {
 		}
 	}
 
-	async fn send(&self, msg: impl Into<Envelope> + Send) -> Result<(), ()> {
+	async fn send(
+		&self,
+		msg: impl Into<Envelope> + Send,
+	) -> Result<(), channel::SendError<Envelope>> {
 		let env: Envelope = msg.into();
 
 		// TODO: Might wanna remove the program if not alive?
@@ -382,9 +386,13 @@ impl<P: Program> Takt<P> {
 			program: Box::into_raw(Box::new(program)),
 			return_pid: send,
 		};
-		self.sender.send(cmd).await?;
+		// TODO: Handle
+		self.sender.send(cmd).await.unwrap();
 
-		recv.recv().await
+		// TODO: Handle
+		let pid = recv.recv().await.unwrap();
+
+		Ok(pid)
 	}
 
 	async fn schedule_and_start(&mut self, program: P) -> Result<Pid, ()> {
@@ -394,15 +402,24 @@ impl<P: Program> Takt<P> {
 	}
 
 	async fn start(&mut self, pid: Pid) -> Result<(), ()> {
-		self.sender.send(Command::Start(pid)).await
+		// TODO: Handle
+		self.sender.send(Command::Start(pid)).await.unwrap();
+
+		Ok(())
 	}
 
 	async fn preempt(&mut self, pid: Pid) -> Result<(), ()> {
-		self.sender.send(Command::Preempt(pid)).await
+		// TODO: Handle
+		self.sender.send(Command::Preempt(pid)).await.unwrap();
+
+		Ok(())
 	}
 
 	async fn kill(&mut self, pid: Pid) -> Result<(), ()> {
-		self.sender.send(Command::Kill(pid)).await
+		// TODO: Handle
+		self.sender.send(Command::Kill(pid)).await.unwrap();
+
+		Ok(())
 	}
 
 	/*
@@ -412,7 +429,10 @@ impl<P: Program> Takt<P> {
 	 */
 
 	async fn end(self) -> Result<(), ()> {
-		self.sender.send(Command::Shutdown).await
+		// TODO: Handle
+		self.sender.send(Command::Shutdown).await.unwrap();
+
+		Ok(())
 	}
 }
 
@@ -432,15 +452,23 @@ where
 	S: Spawner,
 {
 	async fn try_recv(&mut self) -> Result<Option<Envelope>, ()> {
-		self.recv.try_recv().await
+		// TODO: Handle
+		let maybe = self.recv.try_recv().await.unwrap();
+
+		Ok(maybe)
 	}
 
 	async fn recv(&mut self) -> Result<Envelope, ()> {
-		self.recv.recv().await
+		// TODO: Handle
+		let is = self.recv.recv().await.unwrap();
+		Ok(is)
 	}
 
 	async fn send(&mut self, envelope: Envelope) -> Result<(), ()> {
-		self.sender.try_send(envelope).await
+		// TODO: Handle
+		self.sender.try_send(envelope).await.unwrap();
+
+		Ok(())
 	}
 
 	fn sender(&self) -> channel::mpsc::Sender<Envelope> {

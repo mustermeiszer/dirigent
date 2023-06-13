@@ -17,10 +17,20 @@
 
 const DEFAULT_CHANNEL_SIZE: usize = 512;
 
-pub enum Error {}
+#[derive(Debug)]
+pub enum SendError<T> {
+	Closed(T),
+	Full(T),
+}
+
+#[derive(Debug)]
+pub enum RecvError {
+	Closed,
+}
 
 pub mod mpsc {
 	use super::DEFAULT_CHANNEL_SIZE;
+	use crate::channel::{RecvError, SendError};
 
 	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
@@ -37,38 +47,54 @@ pub mod mpsc {
 		)
 	}
 
-	#[derive(Clone)]
+	#[derive(Clone, Debug)]
 	pub struct Sender<T: Send> {
 		inner: flume::Sender<T>,
 	}
 
 	impl<T: Send> Sender<T> {
-		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
-			self.inner.send_async(t.into()).await.map_err(|_| ())
+		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner
+				.send_async(t.into())
+				.await
+				.map_err(|e| SendError::Closed(e.0))
 		}
 
-		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
-			self.inner.try_send(t.into()).map_err(|_| ())
+		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner.try_send(t.into()).map_err(|e| match e {
+				flume::TrySendError::Full(t) => SendError::Full(t),
+				flume::TrySendError::Disconnected(t) => SendError::Closed(t),
+			})
 		}
 	}
 
+	#[derive(Debug)]
 	pub struct Receiver<T: Send> {
 		inner: flume::Receiver<T>,
 	}
 
 	impl<T: Send> Receiver<T> {
-		pub async fn recv(&self) -> Result<T, ()> {
-			self.inner.recv_async().await.map_err(|_| ())
+		pub async fn recv(&self) -> Result<T, RecvError> {
+			self.inner.recv_async().await.map_err(|e| match e {
+				flume::RecvError::Disconnected => RecvError::Closed,
+			})
 		}
 
-		pub async fn try_recv(&self) -> Result<Option<T>, ()> {
-			self.inner.try_recv().map_err(|_| ()).map(|t| Some(t))
+		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+			match self.inner.try_recv() {
+				Ok(t) => Ok(Some(t)),
+				Err(e) => match e {
+					flume::TryRecvError::Disconnected => Err(RecvError::Closed),
+					flume::TryRecvError::Empty => Ok(None),
+				},
+			}
 		}
 	}
 }
 
 pub mod mpmc {
 	use super::DEFAULT_CHANNEL_SIZE;
+	use crate::channel::{RecvError, SendError};
 
 	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
@@ -85,38 +111,122 @@ pub mod mpmc {
 		)
 	}
 
-	#[derive(Clone)]
+	#[derive(Clone, Debug)]
 	pub struct Sender<T: Send> {
 		inner: crossbeam::channel::Sender<T>,
 	}
 
 	impl<T: Send> Sender<T> {
-		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
-			self.inner.send(t.into()).map_err(|_| ())
+		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner.send(t.into()).map_err(|e| match e {
+				crossbeam::channel::SendError(t) => SendError::Closed(t),
+			})
 		}
 
-		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), ()> {
-			self.inner.try_send(t.into()).map_err(|_| ())
+		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner.try_send(t.into()).map_err(|e| match e {
+				crossbeam::channel::TrySendError::Full(t) => SendError::Full(t),
+				crossbeam::channel::TrySendError::Disconnected(t) => SendError::Closed(t),
+			})
 		}
 	}
 
-	#[derive(Clone)]
+	#[derive(Clone, Debug)]
 	pub struct Receiver<T: Send> {
 		inner: crossbeam::channel::Receiver<T>,
 	}
 
 	impl<T: Send> Receiver<T> {
-		pub async fn recv(&self) -> Result<T, ()> {
-			self.inner.recv().map_err(|_| ())
+		pub async fn recv(&self) -> Result<T, RecvError> {
+			self.inner.recv().map_err(|e| match e {
+				crossbeam::channel::RecvError => RecvError::Closed,
+			})
 		}
 
-		pub async fn try_recv(&self) -> Result<Option<T>, ()> {
-			self.inner.try_recv().map_err(|_| ()).map(|t| Some(t))
+		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+			match self.inner.try_recv() {
+				Ok(t) => Ok(Some(t)),
+				Err(e) => match e {
+					crossbeam::channel::TryRecvError::Disconnected => Err(RecvError::Closed),
+					crossbeam::channel::TryRecvError::Empty => Ok(None),
+				},
+			}
+		}
+	}
+}
+
+pub mod spmc {
+	use super::DEFAULT_CHANNEL_SIZE;
+	use crate::channel::{RecvError, SendError};
+
+	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
+	}
+
+	pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+		let (inner_sender, inner_recv) = crossbeam::channel::bounded::<T>(SIZE);
+
+		(
+			Sender {
+				inner: inner_sender,
+			},
+			Receiver { inner: inner_recv },
+		)
+	}
+
+	#[derive(Debug)]
+	pub struct Sender<T: Send> {
+		inner: crossbeam::channel::Sender<T>,
+	}
+
+	impl<T: Send> Sender<T> {
+		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner.send(t.into()).map_err(|e| match e {
+				crossbeam::channel::SendError(t) => SendError::Closed(t),
+			})
+		}
+
+		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner.try_send(t.into()).map_err(|e| match e {
+				crossbeam::channel::TrySendError::Full(t) => SendError::Full(t),
+				crossbeam::channel::TrySendError::Disconnected(t) => SendError::Closed(t),
+			})
+		}
+	}
+
+	#[derive(Clone, Debug)]
+	pub struct Receiver<T: Send> {
+		inner: crossbeam::channel::Receiver<T>,
+	}
+
+	impl<T: Send> Receiver<T> {
+		pub async fn recv(&self) -> Result<T, RecvError> {
+			self.inner.recv().map_err(|e| match e {
+				crossbeam::channel::RecvError => RecvError::Closed,
+			})
+		}
+
+		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+			match self.inner.try_recv() {
+				Ok(t) => Ok(Some(t)),
+				Err(e) => match e {
+					crossbeam::channel::TryRecvError::Disconnected => Err(RecvError::Closed),
+					crossbeam::channel::TryRecvError::Empty => Ok(None),
+				},
+			}
 		}
 	}
 }
 
 pub mod oneshot {
+	use crate::channel::{RecvError, SendError};
+
+	#[derive(Debug)]
+	pub enum TryRecvOk<T, Recv> {
+		Value(T),
+		Recv(Recv),
+	}
+
 	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, 1>()
 	}
@@ -132,23 +242,47 @@ pub mod oneshot {
 		)
 	}
 
+	#[derive(Debug)]
 	pub struct Sender<T: Send> {
 		inner: flume::Sender<T>,
 	}
 
 	impl<T: Send> Sender<T> {
-		pub async fn send(self, t: impl Into<T> + Send) -> Result<(), ()> {
-			self.inner.send_async(t.into()).await.map_err(|_| ())
+		pub async fn send(self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+			self.inner
+				.send_async(t.into())
+				.await
+				.map_err(|e| SendError::Closed(e.0))
+		}
+
+		pub async fn try_send(self, t: impl Into<T> + Send) -> Result<(), SendError<(Self, T)>> {
+			self.inner.try_send(t.into()).map_err(|e| match e {
+				flume::TrySendError::Full(t) => SendError::Full((self, t)),
+				flume::TrySendError::Disconnected(t) => SendError::Closed((self, t)),
+			})
 		}
 	}
 
+	#[derive(Debug)]
 	pub struct Receiver<T: Send> {
 		inner: flume::Receiver<T>,
 	}
 
 	impl<T: Send> Receiver<T> {
-		pub async fn recv(&self) -> Result<T, ()> {
-			self.inner.recv_async().await.map_err(|_| ())
+		pub async fn recv(self) -> Result<T, RecvError> {
+			self.inner.recv_async().await.map_err(|e| match e {
+				flume::RecvError::Disconnected => RecvError::Closed,
+			})
+		}
+
+		pub async fn try_recv(self) -> Result<TryRecvOk<T, Self>, RecvError> {
+			match self.inner.try_recv() {
+				Ok(t) => Ok(TryRecvOk::Value(t)),
+				Err(e) => match e {
+					flume::TryRecvError::Disconnected => Err(RecvError::Closed),
+					flume::TryRecvError::Empty => Ok(TryRecvOk::Recv(self)),
+				},
+			}
 		}
 	}
 }
