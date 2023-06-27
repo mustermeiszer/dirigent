@@ -14,3 +14,8 @@ async-trait = "0.1.68"
 sync_wrapper = "0.1.2"
 flume = "0.10.14"
 crossbeam = "0.8.2"
+futures-timer = "3.0.2"
+tracing = "0.1.37"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.17"

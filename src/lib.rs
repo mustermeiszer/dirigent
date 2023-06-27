@@ -17,19 +17,15 @@
 
 #![allow(dead_code)]
 
-// TODO: Remove std dependency
-use std::{
-	ops::AddAssign,
-	pin::Pin,
-	sync::{Arc, Mutex},
-	task::{Context, Poll},
-};
+use core::ops::AddAssign;
 
 use futures::{future::BoxFuture, Future};
+use tracing::{error, trace, warn};
 
 use crate::{
+	channel::{oneshot::channel, RecvError, SendError},
 	envelope::Envelope,
-	traits::{ExitStatus, Index, Program, Spawner},
+	traits::{ExitStatus, Index, Priority, PriorityExt, Program, ScheduleExt, Scheduler, Spawner},
 };
 
 pub mod channel;
@@ -42,10 +38,18 @@ pub mod traits;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Pid(usize);
 
+impl Pid {
+	pub fn new(pid: usize) -> Self {
+		Pid(pid)
+	}
+}
+
 #[derive(Debug)]
 enum Command<P> {
 	Schedule {
 		program: *const P,
+		name: &'static str,
+		priority: Priority,
 		return_pid: channel::mpsc::Sender<Pid>,
 	},
 	Start(Pid),
@@ -57,37 +61,27 @@ enum Command<P> {
 	ForceShutdown,
 }
 
+// NOTE: The safety results from the fact, that the dirigent
+//       only ever receives the raw point from the public
+//       interface of the `struct Takt`, which takes care
+//       of leaking an owned valued of `trait Program`.
 unsafe impl<P: Send> Send for Command<P> {}
-
-impl<P> Clone for Command<P> {
-	fn clone(&self) -> Self {
-		match self {
-			Command::Schedule {
-				program,
-				return_pid,
-			} => Command::Schedule {
-				program: program.clone(),
-				return_pid: return_pid.clone(),
-			},
-			Command::Start(pid) => Command::Start(*pid),
-			Command::Preempt(pid) => Command::Start(*pid),
-			Command::FetchRunning(sender) => Command::FetchRunning(sender.clone()),
-			Command::Kill(pid) => Command::Kill(*pid),
-			Command::KillAll => Command::KillAll,
-			Command::Shutdown => Command::Shutdown,
-			Command::ForceShutdown => Command::ForceShutdown,
-		}
-	}
-}
 
 struct Instrum<P> {
 	pid: Pid,
+	name: &'static str,
+	priority: Priority,
 	program: P,
 }
 
 impl<P: Program> Instrum<P> {
 	fn play<S: Spawner>(self, spawner: &S) -> ActiveInstrum {
-		let Instrum { pid, program } = self;
+		let Instrum {
+			pid,
+			name,
+			program,
+			priority,
+		} = self;
 
 		let (sender_of_dirigent, recv_of_program) = channel::mpsc::channel();
 		let (sender_of_program, recv_of_dirigent) = channel::mpsc::channel();
@@ -101,24 +95,50 @@ impl<P: Program> Instrum<P> {
 			sender: sender_of_program,
 		};
 
-		let process = Box::new(program).start(Box::new(context));
+		let process = async move {
+			if let Err(e) = Box::new(program).start(Box::new(context)).await {
+				error!(
+					"Program {} (PID: {:?}) exited with an error. Error: {:?}",
+					name, pid, e
+				)
+			} else {
+				trace!("Program {} (PID: {:?}) finished.", name, pid,)
+			}
 
-		let mut active = ActiveInstrum {
+			()
+		};
+
+		let scheduler = Scheduler::new();
+		// Add a prioritize wrapper around the future, so we can prioritize it.
+		// Add a scheduler wrapper around the future, so we can control it.
+		let state = process.prioritize(priority).schedule(scheduler.reference());
+
+		let active = ActiveInstrum {
 			pid,
-			state: State::Init(sync_wrapper::SyncWrapper::new(process)),
+			name,
+			scheduler,
 			to_instance: sender_of_dirigent,
 			index,
 			from_instance: recv_of_dirigent,
 		};
 
-		active.start(spawner);
+		trace!(
+			"Starting program '{} [with {:?}, {:?}]'.",
+			name,
+			pid,
+			priority
+		);
+
+		spawner.spawn(state);
+
 		active
 	}
 }
 
 struct ActiveInstrum {
 	pid: Pid,
-	state: State,
+	name: &'static str,
+	scheduler: Scheduler,
 	index: Box<dyn Index>,
 	to_instance: channel::mpsc::Sender<Envelope>,
 	from_instance: channel::mpsc::Receiver<Envelope>,
@@ -133,46 +153,28 @@ impl ActiveInstrum {
 	async fn try_consume(&self, envelope: Envelope) {
 		if self.index.indexed(&envelope) {
 			// TODO: Fix error or make not result
-			self.to_instance
-				.try_send(envelope)
-				.await
-				.expect("Sending to instance failed. Panic...")
-		}
-	}
+			// TODO: Remove the program if not alive
 
-	fn initialized(&self) -> bool {
-		match &self.state {
-			State::Uninit | State::Running(_) | State::Preempted(_) | State::Exited => false,
-			State::Init(_) => true,
-		}
-	}
+			if self.scheduler.alive() {
+				let message_id = envelope.message_id();
 
-	fn alive(&self) -> bool {
-		match &self.state {
-			State::Uninit | State::Init(_) | State::Exited => false,
-			State::Running(_) | State::Preempted(_) => true,
-		}
-	}
-
-	fn start(&mut self, spawner: &impl Spawner) {
-		if self.initialized() {
-			let mut state = State::Uninit;
-			core::mem::swap(&mut self.state, &mut state);
-
-			if let State::Init(state) = state {
-				let instance_state = Arc::new(Mutex::new(InstanceState::Running));
-
-				let spawned_instance = SpawnedInstance {
-					inner: state.into_inner(),
-					instance_state: instance_state.clone(),
-				};
-				self.state = State::Running(RefSpawnedInstance(instance_state));
-				spawner.spawn(spawned_instance)
-			} else {
-				unreachable!("Control flow prohibits this state.")
+				if let Err(e) = self.to_instance.try_send(envelope.clone()).await {
+					match e {
+						SendError::Closed(_) => {
+							warn!(
+								"Program: {} ({:?}) failed to be send to. Reason: Channel is closed. Message ID: {:?}",
+								self.name, self.pid, message_id
+							)
+						}
+						SendError::Full(_) => {
+							warn!(
+								"Program: {} ({:?}) failed to be send to. Reason: Channel is full. Message ID: {:?}",
+								self.name, self.pid, message_id
+							)
+						}
+					}
+				}
 			}
-		} else {
-			// TODO: Error here
 		}
 	}
 
@@ -182,43 +184,34 @@ impl ActiveInstrum {
 	) -> Result<(), channel::SendError<Envelope>> {
 		let env: Envelope = msg.into();
 
-		// TODO: Might wanna remove the program if not alive?
-		if self.alive() {
+		if self.scheduler.alive() {
 			self.to_instance.send(env).await
 		} else {
+			// TODO: Remove the program if not alive
 			Ok(())
 		}
 	}
 
 	// TODO: Research race-conditions
-	async fn preempt(&mut self) -> Result<(), ()> {
-		let spawned = match &self.state {
-			State::Uninit | State::Init(_) | State::Preempted(_) | State::Exited => return Err(()),
-			State::Running(spawned) => {
-				let mut l = spawned.0.lock().map_err(|_| ())?;
-				*l = InstanceState::Preempted;
-
-				spawned
-			}
-		};
-
-		self.state = State::Preempted(spawned.clone());
-
-		Ok(())
+	fn schedule(&mut self) {
+		trace!(
+			"Scheduling program {} [{:?}] for running.",
+			self.name,
+			self.pid,
+		);
+		self.scheduler.schedule();
 	}
 
 	// TODO: Research race-conditions
-	async fn kill(&mut self) -> Result<(), ()> {
-		match &self.state {
-			State::Uninit | State::Init(_) | State::Exited => return Err(()),
-			State::Running(spawned) | State::Preempted(spawned) => {
-				let mut l = spawned.0.lock().map_err(|_| ())?;
-				*l = InstanceState::Killed;
-			}
-		}
-		self.state = State::Exited;
+	fn preempt(&mut self) {
+		trace!("Preempting program {} [{:?}].", self.name, self.pid,);
+		self.scheduler.preempt();
+	}
 
-		Ok(())
+	// TODO: Research race-conditions
+	fn kill(&mut self) {
+		trace!("Killing program {} [{:?}].", self.name, self.pid,);
+		self.scheduler.kill();
 	}
 }
 
@@ -261,11 +254,28 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 		}
 	}
 
-	pub fn schedule(&mut self, program: P) -> Result<(), ()> {
-		self.scheduled.push(Instrum {
+	pub fn schedule(
+		&mut self,
+		program: P,
+		name: &'static str,
+		priority: Priority,
+	) -> Result<(), ()> {
+		let instrum = Instrum {
 			pid: self.pid_allocation.pid(),
+			name,
+			priority,
 			program,
-		});
+		};
+
+		trace!(
+			"Scheduled program {} [with {:?}, {:?}]",
+			instrum.name,
+			instrum.pid,
+			instrum.priority
+		);
+
+		self.scheduled.push(instrum);
+
 		Ok(())
 	}
 
@@ -286,8 +296,8 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 		} = self;
 
 		for instrum in scheduled {
-			let active_instrum = instrum.play(&spawner);
-			running.push(active_instrum);
+			let active = instrum.play(&spawner);
+			running.push(active);
 		}
 
 		let mut scheduled = Vec::new();
@@ -300,6 +310,8 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 						Command::Schedule {
 							program,
 							return_pid,
+							name,
+							priority,
 						} => {
 							// TODO: Verify safety assumptions...
 
@@ -318,11 +330,21 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 							// dereference it here
 							let program = unsafe { *Box::from_raw(program as *mut P) };
 
-							scheduled.push(Instrum {
+							let instrum = Instrum {
 								program,
 								pid: pid_allocation.pid(),
-							});
+								name,
+								priority,
+							};
 
+							trace!(
+								"Scheduled program {} [with {:?}, {:?}]",
+								instrum.name,
+								instrum.pid,
+								instrum.priority
+							);
+
+							scheduled.push(instrum);
 							return_pid.send(pid_allocation.last()).await.unwrap();
 						}
 						Command::FetchRunning(_) => {}
@@ -330,13 +352,28 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 							if let Some(index) =
 								scheduled.iter().position(|instrum| instrum.pid == pid)
 							{
-								running.push(scheduled.swap_remove(index).play(&spawner));
+								let active = scheduled.swap_remove(index).play(&spawner);
+								running.push(active);
 							} else {
-								// TODO: Trace warning here
+								warn!(
+									"Could not start program with {:?}. Reason: Not scheduled.",
+									pid
+								)
 							}
 						}
 						Command::Preempt(_) => {}
-						Command::Kill(_) => {}
+						Command::Kill(pid) => {
+							if let Some(index) =
+								running.iter().position(|instrum| instrum.pid == pid)
+							{
+								running.swap_remove(index).kill();
+							} else {
+								warn!(
+									"Could not kill program with {:?}. Reason: Not running.",
+									pid
+								)
+							}
+						}
 						Command::KillAll => {}
 						Command::ForceShutdown => {}
 						Command::Shutdown => break,
@@ -344,8 +381,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 				}
 			} else {
 				// Something is off now. We stop working
-				//panic!("Dirigent can no longer receive commands.
-				// Panic...")
+				panic!("Dirigent can no longer receive commands.");
 			}
 
 			// Serve processes
@@ -380,11 +416,18 @@ unsafe impl<P: Program> Send for Takt<P> {}
 unsafe impl<P: Program> Sync for Takt<P> {}
 
 impl<P: Program> Takt<P> {
-	async fn schedule(&mut self, program: P) -> Result<Pid, ()> {
+	async fn schedule(
+		&mut self,
+		program: P,
+		name: &'static str,
+		priority: Priority,
+	) -> Result<Pid, ()> {
 		let (send, recv) = channel::mpsc::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: Box::into_raw(Box::new(program)),
 			return_pid: send,
+			name,
+			priority,
 		};
 		// TODO: Handle
 		self.sender.send(cmd).await.unwrap();
@@ -395,8 +438,13 @@ impl<P: Program> Takt<P> {
 		Ok(pid)
 	}
 
-	async fn schedule_and_start(&mut self, program: P) -> Result<Pid, ()> {
-		let pid = self.schedule(program).await?;
+	async fn schedule_and_start(
+		&mut self,
+		program: P,
+		name: &'static str,
+		priority: Priority,
+	) -> Result<Pid, ()> {
+		let pid = self.schedule(program, name, priority).await?;
 		self.start(pid).await?;
 		Ok(pid)
 	}
@@ -436,8 +484,18 @@ impl<P: Program> Takt<P> {
 	}
 }
 
-pub struct SubSpawner<Spawner> {
+struct SubSpawner<Spawner> {
 	spawner: Spawner,
+}
+
+impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawner.spawn_blocking(future)
+	}
+
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawner.spawn(future)
+	}
 }
 
 pub struct ContextImpl<Spawner> {
@@ -451,77 +509,31 @@ impl<S> traits::Context for ContextImpl<S>
 where
 	S: Spawner,
 {
-	async fn try_recv(&mut self) -> Result<Option<Envelope>, ()> {
-		// TODO: Handle
-		let maybe = self.recv.try_recv().await.unwrap();
-
-		Ok(maybe)
+	async fn try_recv(&mut self) -> Result<Option<Envelope>, RecvError> {
+		self.recv.try_recv().await
 	}
 
-	async fn recv(&mut self) -> Result<Envelope, ()> {
-		// TODO: Handle
-		let is = self.recv.recv().await.unwrap();
-		Ok(is)
+	async fn recv(&mut self) -> Result<Envelope, RecvError> {
+		self.recv.recv().await
 	}
 
-	async fn send(&mut self, envelope: Envelope) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.try_send(envelope).await.unwrap();
+	async fn send(&mut self, envelope: Envelope) -> Result<(), SendError<Envelope>> {
+		self.sender.send(envelope).await
+	}
 
-		Ok(())
+	async fn try_send(&mut self, envelope: Envelope) -> Result<(), SendError<Envelope>> {
+		self.sender.try_send(envelope).await
 	}
 
 	fn sender(&self) -> channel::mpsc::Sender<Envelope> {
 		self.sender.clone()
 	}
 
-	fn spawn_sub(&mut self, _sub: BoxFuture<'static, ExitStatus>) {
-		todo!()
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		self.spawner.spawn(sub)
 	}
 
-	fn spawn_sub_blocking(&mut self, _sub: BoxFuture<'static, ExitStatus>) {
-		todo!()
-	}
-}
-
-pub enum State {
-	Uninit,
-	Init(sync_wrapper::SyncWrapper<BoxFuture<'static, ExitStatus>>),
-	Running(RefSpawnedInstance),
-	Preempted(RefSpawnedInstance),
-	Exited,
-}
-
-#[derive(Clone)]
-pub struct RefSpawnedInstance(Arc<Mutex<InstanceState>>);
-
-#[pin_project::pin_project]
-struct SpawnedInstance {
-	#[pin]
-	inner: BoxFuture<'static, ExitStatus>,
-	instance_state: Arc<Mutex<InstanceState>>,
-}
-
-#[derive(Clone, Copy)]
-pub enum InstanceState {
-	Preempted,
-	Running,
-	Killed,
-}
-
-impl Future for SpawnedInstance {
-	type Output = ExitStatus;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = self.project();
-		if let Some(state) = this.instance_state.lock().ok() {
-			match *state {
-				InstanceState::Running => this.inner.poll(cx),
-				InstanceState::Preempted => Poll::Pending,
-				InstanceState::Killed => Poll::Ready(Err(())),
-			}
-		} else {
-			Poll::Ready(Err(()))
-		}
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		self.spawner.spawn_blocking(sub)
 	}
 }

@@ -3,10 +3,6 @@
 // Copyright (C) Frederik Gartenmeister.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::thread;
-
-use tokio::runtime::Handle;
-
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,49 +16,52 @@ use tokio::runtime::Handle;
 // limitations under the License.
 use crate as dirigent;
 use crate::{
-	envelope::Envelope,
-	traits::{Context, ExitStatus, Index, Program},
+	traits::{Context, ExitStatus, Index, Priority, Program},
+	Pid,
 };
 
 #[derive(Clone)]
 struct Message {
-	text: &'static str,
+	text: String,
 }
 
 impl dirigent::traits::Message for Message {
 	type Response = ();
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TestProgram1;
 #[async_trait::async_trait]
 impl dirigent::traits::Program for TestProgram1 {
 	async fn start(self: Box<Self>, mut ctx: Box<dyn Context>) -> ExitStatus {
-		println!("Hello, World from Test Programm 1!");
+		tracing::info!("Hello, World from Test Programm 1!");
 
 		let msg = Message {
-			text: "Hello From Program 1",
+			text: "Hello From Program 1".to_owned(),
 		};
 		ctx.send(msg.into()).await.unwrap();
 
 		// Will never receive
 		ctx.recv().await.unwrap();
 
-		println!("NEEVER");
+		tracing::info!("NEEVER");
 
 		Ok(())
 	}
 }
 
-#[derive(Clone)]
-struct TestProgram2;
+#[derive(Clone, Debug)]
+struct TestProgram2 {
+	name: &'static str,
+}
+
 #[async_trait::async_trait]
 impl dirigent::traits::Program for TestProgram2 {
 	async fn start(self: Box<Self>, mut ctx: Box<dyn Context>) -> ExitStatus {
-		println!("Hello, World from Test Programm 2!");
+		tracing::info!("Hello, World from Test Programm {}!", self.name);
 
 		let msg = Message {
-			text: "Hello From Program 2",
+			text: format!("Hello From Program {}", self.name),
 		};
 		ctx.send(msg.into()).await.unwrap();
 
@@ -70,7 +69,7 @@ impl dirigent::traits::Program for TestProgram2 {
 
 		let msg = envelope.read_ref::<Message>().unwrap();
 
-		println!("{}", msg.text);
+		tracing::info!("{} received: {}", self.name, msg.text);
 
 		Ok(())
 	}
@@ -84,23 +83,40 @@ impl dirigent::traits::Program for TestProgram2 {
 fn test_1() {
 	use tokio::runtime::Runtime;
 
+	let subscriber = tracing_subscriber::FmtSubscriber::builder()
+		.with_max_level(tracing::Level::TRACE)
+		.finish();
+	tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
 	// Create the runtime
 	let rt = Runtime::new().unwrap();
 	let mut dirigent = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
 
-	dirigent.schedule(Box::new(TestProgram1 {})).unwrap();
-	dirigent.schedule(Box::new(TestProgram2 {})).unwrap();
-	let mut takt = dirigent.takt();
-	let p = TestProgram2 {};
-	let p = Box::new(p);
+	dirigent
+		.schedule(Box::new(TestProgram1 {}), "Test 1", Priority::High)
+		.unwrap();
+	dirigent
+		.schedule(
+			Box::new(TestProgram2 { name: "Test 2" }),
+			"Test 2",
+			Priority::Custom(2000),
+		)
+		.unwrap();
 
+	let takt = dirigent.takt();
 	rt.spawn(async move {
 		let mut takt = takt;
-		takt.schedule_and_start(p).await;
+		takt.schedule_and_start(
+			Box::new(TestProgram2 { name: "Test 3" }),
+			"Test 3",
+			Priority::Middle,
+		)
+		.await
+		.unwrap();
 	});
 
 	rt.block_on(async move {
-		dirigent.begin().await;
+		dirigent.begin().await.unwrap();
 	});
 }
 
@@ -112,17 +128,20 @@ fn test_2() {
 	let rt = Runtime::new().unwrap();
 	let mut dirigent = dirigent::Dirigent::<TestProgram2, _>::new(rt);
 
-	dirigent.schedule(TestProgram2 {}).unwrap();
-	let mut takt = dirigent.takt();
-	let p = TestProgram2 {};
+	dirigent
+		.schedule(TestProgram2 { name: "Test 2" }, "Test 2", Priority::High)
+		.unwrap();
+	let takt = dirigent.takt();
 
 	let rt = Runtime::new().unwrap();
 	rt.spawn(async move {
 		let mut takt = takt;
-		takt.schedule_and_start(p).await;
+		takt.schedule_and_start(TestProgram2 { name: "Test 1" }, "Test 1", Priority::High)
+			.await
+			.unwrap();
 	});
 
 	rt.block_on(async move {
-		dirigent.begin().await;
+		dirigent.begin().await.expect("Failed launching dirigent.");
 	});
 }
