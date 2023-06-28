@@ -113,6 +113,8 @@ fn test_1() {
 		)
 		.await
 		.unwrap();
+
+		takt.kill(Pid::new(2)).await.unwrap();
 	});
 
 	rt.block_on(async move {

@@ -20,12 +20,15 @@
 use core::ops::AddAssign;
 
 use futures::{future::BoxFuture, Future};
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
 use crate::{
 	channel::{oneshot::channel, RecvError, SendError},
 	envelope::Envelope,
-	traits::{ExitStatus, Index, Priority, PriorityExt, Program, ScheduleExt, Scheduler, Spawner},
+	traits::{
+		ExitStatus, Index, Priority, PriorityExt, Program, ScheduleExt, Scheduler, SchedulerRef,
+		Spawner,
+	},
 };
 
 pub mod channel;
@@ -86,32 +89,44 @@ impl<P: Program> Instrum<P> {
 		let (sender_of_dirigent, recv_of_program) = channel::mpsc::channel();
 		let (sender_of_program, recv_of_dirigent) = channel::mpsc::channel();
 		let index = program.index();
+		let scheduler = Scheduler::new();
 
 		let context = ContextImpl {
+			sub_pid_allocation: PidAllocation::new(),
 			spawner: SubSpawner {
+				parent_name: name.clone(),
+				parent_pid: pid,
+				priority,
+				scheduler_ref: scheduler.reference(),
 				spawner: spawner.handle(),
 			},
 			recv: recv_of_program,
 			sender: sender_of_program,
 		};
 
-		let process = async move {
-			if let Err(e) = Box::new(program).start(Box::new(context)).await {
-				error!(
-					"Program {} (PID: {:?}) exited with an error. Error: {:?}",
-					name, pid, e
-				)
-			} else {
-				trace!("Program {} (PID: {:?}) finished.", name, pid,)
-			}
-
-			()
-		};
-
-		let scheduler = Scheduler::new();
+		let process = Box::new(program).start(Box::new(context));
 		// Add a prioritize wrapper around the future, so we can prioritize it.
 		// Add a scheduler wrapper around the future, so we can control it.
-		let state = process.prioritize(priority).schedule(scheduler.reference());
+		let process = process.prioritize(priority).schedule(scheduler.reference());
+
+		let process = async move {
+			let res = process.await;
+
+			match res {
+				Err(e) => {
+					warn!("Process {} [{:?}], exited with error: {:?}", name, pid, e)
+				}
+				Ok(inner_res) => {
+					if let Err(e) = inner_res {
+						warn!("Process {} [{:?}]exited with error: {:?}", name, pid, e)
+					} else {
+						trace!("Process {} [{:?}] finished.", name, pid,)
+					}
+				}
+			}
+
+			Ok(())
+		};
 
 		let active = ActiveInstrum {
 			pid,
@@ -129,7 +144,7 @@ impl<P: Program> Instrum<P> {
 			priority
 		);
 
-		spawner.spawn(state);
+		spawner.spawn(process);
 
 		active
 	}
@@ -485,21 +500,114 @@ impl<P: Program> Takt<P> {
 }
 
 struct SubSpawner<Spawner> {
+	parent_pid: Pid,
+	parent_name: &'static str,
+	priority: Priority,
+	scheduler_ref: SchedulerRef,
 	spawner: Spawner,
 }
 
 impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
-	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+	fn spawn_blocking(
+		&self,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
+		name: &'static str,
+		pid: Pid,
+	) {
+		let future = future
+			.prioritize(self.priority)
+			.schedule(self.scheduler_ref.clone());
+
+		let name = name.clone();
+		let parent_pid = self.parent_pid;
+		let parent_name = self.parent_name;
+
+		let future = async move {
+			let res = future.await;
+
+			match res {
+				Err(e) => {
+					warn!(
+						"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+						name, pid, parent_name, parent_pid, e
+					)
+				}
+				Ok(inner_res) => {
+					if let Err(e) = inner_res {
+						warn!(
+							"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+							name, pid, parent_name, parent_pid, e
+						)
+					} else {
+						trace!(
+							"Subprocess {} [{:?}, Parent: [{},{:?}]] finished.",
+							name,
+							pid,
+							parent_name,
+							parent_pid,
+						)
+					}
+				}
+			}
+
+			Ok(())
+		};
+
 		self.spawner.spawn_blocking(future)
 	}
 
-	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+	fn spawn(
+		&self,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
+		name: &'static str,
+		pid: Pid,
+	) {
+		let future = future
+			.prioritize(self.priority)
+			.schedule(self.scheduler_ref.clone());
+
+		let name = name.clone();
+		let parent_pid = self.parent_pid;
+		let parent_name = self.parent_name;
+
+		let future = async move {
+			let res = future.await;
+
+			match res {
+				Err(e) => {
+					warn!(
+						"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+						name, pid, parent_name, parent_pid, e
+					)
+				}
+				Ok(inner_res) => {
+					if let Err(e) = inner_res {
+						warn!(
+							"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+							name, pid, parent_name, parent_pid, e
+						)
+					} else {
+						trace!(
+							"Subprocess {} [{:?}, Parent: [{},{:?}]] finished.",
+							name,
+							pid,
+							parent_name,
+							parent_pid,
+						)
+					}
+				}
+			}
+
+			Ok(())
+		};
+
 		self.spawner.spawn(future)
 	}
 }
 
 pub struct ContextImpl<Spawner> {
 	spawner: SubSpawner<Spawner>,
+	sub_pid_allocation: PidAllocation,
 	recv: channel::mpsc::Receiver<Envelope>,
 	sender: channel::mpsc::Sender<Envelope>,
 }
@@ -529,11 +637,20 @@ where
 		self.sender.clone()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
-		self.spawner.spawn(sub)
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>, name: Option<&'static str>) {
+		// TODO: Possible to concat with parent name?
+		let name = name.unwrap_or("_sub");
+		self.spawner.spawn(sub, name, self.sub_pid_allocation.pid())
 	}
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
-		self.spawner.spawn_blocking(sub)
+	fn spawn_sub_blocking(
+		&mut self,
+		sub: BoxFuture<'static, ExitStatus>,
+		name: Option<&'static str>,
+	) {
+		// TODO: Possible to concat with parent name?
+		let name = name.unwrap_or("_sub_blocking");
+		self.spawner
+			.spawn_blocking(sub, name, self.sub_pid_allocation.pid())
 	}
 }

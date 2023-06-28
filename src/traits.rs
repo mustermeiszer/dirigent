@@ -101,9 +101,13 @@ pub trait Context: Send + 'static {
 
 	fn sender(&self) -> channel::mpsc::Sender<Envelope>;
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>);
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>, name: Option<&'static str>);
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>);
+	fn spawn_sub_blocking(
+		&mut self,
+		sub: BoxFuture<'static, ExitStatus>,
+		name: Option<&'static str>,
+	);
 }
 
 #[async_trait::async_trait]
@@ -128,12 +132,16 @@ impl Context for Box<dyn Context> {
 		(**self).sender()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
-		(**self).spawn_sub(sub)
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>, name: Option<&'static str>) {
+		(**self).spawn_sub(sub, name)
 	}
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
-		(**self).spawn_sub_blocking(sub)
+	fn spawn_sub_blocking(
+		&mut self,
+		sub: BoxFuture<'static, ExitStatus>,
+		name: Option<&'static str>,
+	) {
+		(**self).spawn_sub_blocking(sub, name)
 	}
 }
 
