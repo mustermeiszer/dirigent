@@ -15,119 +15,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::{any::Any, cmp::Ordering};
-use std::{any::TypeId, sync::Mutex};
+use core::any::Any;
+use std::any::TypeId;
 
-// TODO: This makes this crate wasm incompatible
 type Arc<T> = std::sync::Arc<T>;
 
-use crate::{channel, traits::Message};
-
-#[derive(Debug)]
-pub enum ResponseError {
-	TooManyResponses,
-	ResponseReceiverDropped,
-}
-
-#[derive(Clone)]
-struct Responder<M: Message> {
-	sender: channel::mpsc::Sender<M::Response>,
-	answers: Arc<Mutex<u32>>,
-	_min_answers: u32,
-	max_answers: u32,
-}
-
-unsafe impl<M: Message + Send> Send for Responder<M> {}
-
-impl<M: Message> Responder<M> {
-	pub async fn respond(&self, with: M::Response) -> Result<(), ResponseError> {
-		// TODO: Handle unwrap()
-		let mut locked_counter = self.answers.lock().unwrap();
-		match self.max_answers.cmp(&(*locked_counter + 1)) {
-			Ordering::Greater => Err(ResponseError::TooManyResponses),
-			Ordering::Equal | Ordering::Less => {
-				self.sender
-					.send(with)
-					.await
-					.map_err(|_| ResponseError::ResponseReceiverDropped)?;
-				*locked_counter += 1;
-				Ok(())
-			}
-		}
-	}
-}
-
-pub struct Letter<M: Message> {
-	message: M,
-	responder: Option<Responder<M>>,
-}
-
-unsafe impl<M: Message + Send> Send for Letter<M> {}
-
-impl<M: Message> From<M> for Letter<M> {
-	fn from(message: M) -> Self {
-		Letter {
-			message,
-			responder: None,
-		}
-	}
-}
-
-impl<M: Message> Letter<M> {
-	pub fn new(message: M) -> Self {
-		Letter {
-			message,
-			responder: None,
-		}
-	}
-
-	pub fn expect_response(&mut self) -> channel::mpsc::Receiver<M::Response> {
-		self.expect_responses(1, 1)
-	}
-
-	pub fn expect_responses(&mut self, min: u32, max: u32) -> channel::mpsc::Receiver<M::Response> {
-		let (sender, receiver) = channel::mpsc::channel::<M::Response>();
-
-		self.responder = Some(Responder {
-			sender,
-			answers: Arc::new(Mutex::new(0)),
-			_min_answers: min,
-			max_answers: max,
-		});
-
-		receiver
-	}
-
-	pub fn seal(self) -> Envelope {
-		Envelope {
-			inner: Arc::new(Box::new(self)),
-			read: Arc::new(Mutex::new(false)),
-		}
-	}
-
-	pub fn message(&self) -> &M {
-		&self.message
-	}
-}
+use crate::traits::Message;
 
 #[derive(Debug)]
 pub enum EnvelopeError {
-	Response(ResponseError),
-	WrongResponse,
-	NoResponseExpected,
-	MessageNotExpected,
-}
-
-impl From<ResponseError> for EnvelopeError {
-	fn from(value: ResponseError) -> Self {
-		EnvelopeError::Response(value)
-	}
+	CouldNotCastToMessage,
 }
 
 #[derive(Clone, Debug)]
 pub struct Envelope {
-	inner: Arc<Box<dyn Any + Send + Sync>>,
-	read: Arc<Mutex<bool>>,
+	inner: Arc<dyn Any + Send + Sync>,
 }
 
 unsafe impl Send for Envelope {}
@@ -135,8 +37,7 @@ unsafe impl Send for Envelope {}
 impl<M: Message> From<M> for Envelope {
 	fn from(message: M) -> Self {
 		Envelope {
-			inner: Arc::new(Box::new(Letter::new(message))),
-			read: Arc::new(Mutex::new(false)),
+			inner: Arc::new(message),
 		}
 	}
 }
@@ -146,36 +47,36 @@ impl Envelope {
 		self.inner.type_id()
 	}
 
+	pub fn try_read_ref<M: Message, F, T>(&self, f: F) -> Option<T>
+	where
+		F: FnOnce(&M) -> T,
+	{
+		self.inner_read_as_ref::<M>().map(|msg| f(msg)).ok()
+	}
+
+	pub fn try_read<M: Message + Clone, F, T>(&self, f: F) -> Option<T>
+	where
+		F: FnOnce(M) -> T,
+	{
+		self.inner_read_as_ref::<M>().map(|msg| f(msg.clone())).ok()
+	}
+
 	pub fn read_ref<M: Message>(&self) -> Result<&M, EnvelopeError> {
-		self.read_as_letter_ref::<M>()
-			.map(|msg_ref| &msg_ref.message)
+		self.inner_read_as_ref::<M>()
 	}
 
-	pub fn read<M: Message>(&self) -> Result<M, EnvelopeError> {
-		self.read_as_letter_ref::<M>()
-			.map(|msg_ref| msg_ref.message.clone())
+	pub fn read<M: Message + Clone>(&self) -> Result<M, EnvelopeError> {
+		self.inner_read_as_ref::<M>().map(|msg| msg.clone())
 	}
 
-	fn read_as_letter_ref<M: Message>(&self) -> Result<&Letter<M>, EnvelopeError> {
+	fn inner_read_as_ref<M: Message>(&self) -> Result<&M, EnvelopeError> {
 		self.inner
-			.downcast_ref::<Letter<M>>()
+			.downcast_ref::<M>()
 			.map(|output| {
-				// TODO: Handle unwrap
-				let mut l = self.read.lock().map_err(|_| ()).unwrap();
-				*l = true;
+				<M as Message>::read(&output);
 
 				output
 			})
-			.ok_or(EnvelopeError::MessageNotExpected)
-	}
-
-	pub async fn answer<M: Message>(&mut self, msg: M::Response) -> Result<(), EnvelopeError> {
-		let letter = self.read_as_letter_ref::<M>()?;
-
-		if let Some(response) = &letter.responder {
-			response.respond(msg).await.map_err(|e| e.into())
-		} else {
-			Err(EnvelopeError::NoResponseExpected)
-		}
+			.ok_or(EnvelopeError::CouldNotCastToMessage)
 	}
 }

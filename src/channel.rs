@@ -70,7 +70,7 @@ pub mod mpsc {
 				.map_err(|e| SendError::Closed(e.0))
 		}
 
-		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+		pub fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
 				flume::TrySendError::Full(t) => SendError::Full(t),
 				flume::TrySendError::Disconnected(t) => SendError::Closed(t),
@@ -83,12 +83,6 @@ pub mod mpsc {
 		inner: flume::Receiver<T>,
 	}
 
-	impl<T: Send> Drop for Receiver<T> {
-		fn drop(&mut self) {
-			tracing::trace!("Dropping Receiver")
-		}
-	}
-
 	impl<T: Send> Receiver<T> {
 		pub async fn recv(&self) -> Result<T, RecvError> {
 			self.inner.recv_async().await.map_err(|e| match e {
@@ -96,7 +90,7 @@ pub mod mpsc {
 			})
 		}
 
-		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+		pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(Some(t)),
 				Err(e) => match e {
@@ -149,7 +143,7 @@ pub mod mpmc {
 			})
 		}
 
-		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+		pub fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
 				crossbeam::channel::TrySendError::Full(t) => SendError::Full(t),
 				crossbeam::channel::TrySendError::Disconnected(t) => SendError::Closed(t),
@@ -179,7 +173,7 @@ pub mod mpmc {
 			})
 		}
 
-		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+		pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(Some(t)),
 				Err(e) => match e {
@@ -222,7 +216,7 @@ pub mod spmc {
 			})
 		}
 
-		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+		pub fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
 				crossbeam::channel::TrySendError::Full(t) => SendError::Full(t),
 				crossbeam::channel::TrySendError::Disconnected(t) => SendError::Closed(t),
@@ -252,7 +246,7 @@ pub mod spmc {
 			})
 		}
 
-		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+		pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(Some(t)),
 				Err(e) => match e {
@@ -296,7 +290,7 @@ pub mod spsc {
 				.map_err(|e| SendError::Closed(e.0))
 		}
 
-		pub async fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
+		pub fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
 				flume::TrySendError::Full(t) => SendError::Full(t),
 				flume::TrySendError::Disconnected(t) => SendError::Closed(t),
@@ -316,7 +310,7 @@ pub mod spsc {
 			})
 		}
 
-		pub async fn try_recv(&self) -> Result<Option<T>, RecvError> {
+		pub fn try_recv(&self) -> Result<Option<T>, RecvError> {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(Some(t)),
 				Err(e) => match e {
@@ -365,7 +359,7 @@ pub mod oneshot {
 				.map_err(|e| SendError::Closed(e.0))
 		}
 
-		pub async fn try_send(self, t: impl Into<T> + Send) -> Result<(), SendError<(Self, T)>> {
+		pub fn try_send(self, t: impl Into<T> + Send) -> Result<(), SendError<(Self, T)>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
 				flume::TrySendError::Full(t) => SendError::Full((self, t)),
 				flume::TrySendError::Disconnected(t) => SendError::Closed((self, t)),
@@ -385,7 +379,7 @@ pub mod oneshot {
 			})
 		}
 
-		pub async fn try_recv(self) -> Result<TryRecvOk<T, Self>, RecvError> {
+		pub fn try_recv(self) -> Result<TryRecvOk<T, Self>, RecvError> {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(TryRecvOk::Value(t)),
 				Err(e) => match e {

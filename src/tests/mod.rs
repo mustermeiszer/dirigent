@@ -3,6 +3,8 @@
 // Copyright (C) Frederik Gartenmeister.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::{task::Poll, time::Duration};
+
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,18 +18,18 @@
 // limitations under the License.
 use crate as dirigent;
 use crate::{
-	traits::{Context, ExitStatus, Index, Priority, Program},
+	envelope::Envelope,
+	traits::{Context, ExitStatus, Index, Program},
 	Pid,
 };
 
 #[derive(Clone)]
 struct Message {
+	from: String,
 	text: String,
 }
 
-impl dirigent::traits::Message for Message {
-	type Response = ();
-}
+impl dirigent::traits::Message for Message {}
 
 #[derive(Clone, Debug)]
 struct TestProgram1;
@@ -37,14 +39,29 @@ impl dirigent::traits::Program for TestProgram1 {
 		tracing::info!("Hello, World from Test Programm 1!");
 
 		let msg = Message {
-			text: "Hello From Program 1".to_owned(),
+			from: "Programm 1".to_string(),
+			text: "Hello From Program 1".to_string(),
 		};
-		ctx.send(msg.into()).await.unwrap();
+		if let Err(e) = ctx.send(msg.into()).await {
+			tracing::error!("Program 1: Could not send, {:?}", e)
+		};
 
-		// Will never receive
-		ctx.recv().await.unwrap();
+		loop {
+			match ctx.try_recv().await {
+				Ok(envelope) => {
+					if let Some(envelope) = envelope {
+						envelope.try_read_ref::<Message, _, _>(|msg| {
+							tracing::info!("Program 1 received: {}", msg.text)
+						});
+					}
+				}
+				Err(_e) => {
+					//tracing::error!("Program 1: Could not recv, {:?}", e)
+				}
+			}
 
-		tracing::info!("NEEVER");
+			//futures_timer::Delay::new(Duration::from_secs(3)).await;
+		}
 
 		Ok(())
 	}
@@ -61,21 +78,49 @@ impl dirigent::traits::Program for TestProgram2 {
 		tracing::info!("Hello, World from Test Programm {}!", self.name);
 
 		let msg = Message {
+			from: self.name.to_string(),
 			text: format!("Hello From Program {}", self.name),
 		};
-		ctx.send(msg.into()).await.unwrap();
 
-		let envelope = ctx.recv().await.unwrap();
+		if let Err(e) = ctx.send(msg.into()).await {
+			tracing::error!("{}: Could not send, {:?}", self.name, e)
+		};
 
-		let msg = envelope.read_ref::<Message>().unwrap();
+		loop {
+			match ctx.recv().await {
+				Ok(envelope) => {
+					//if let Some(envelope) = envelope {
+					envelope.try_read_ref::<Message, _, _>(|msg| {
+						tracing::info!("{} received: {}", self.name, msg.text)
+					});
+					//}
+				}
+				Err(_e) => {
+					//tracing::error!("{}: Could not recv, {:?}", self.name, e)
+				}
+			}
 
-		tracing::info!("{} received: {}", self.name, msg.text);
+			//futures_timer::Delay::new(Duration::from_secs(3)).await;
+		}
 
 		Ok(())
 	}
 
 	fn index(&self) -> Box<dyn Index> {
-		Box::new(dirigent::traits::FullIndex {})
+		Box::new(NotFromSelf {
+			name: self.name.to_string(),
+		})
+	}
+}
+
+struct NotFromSelf {
+	name: String,
+}
+
+impl dirigent::traits::Index for NotFromSelf {
+	fn indexed(&self, t: &Envelope) -> bool {
+		t.try_read_ref::<Message, _, _>(|m| m.from != self.name)
+			.unwrap_or(false)
 	}
 }
 
@@ -93,33 +138,27 @@ fn test_1() {
 	let mut dirigent = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
 
 	dirigent
-		.schedule(Box::new(TestProgram1 {}), "Test 1", Priority::High)
+		.schedule(Box::new(TestProgram2 { name: "FOO" }), "FOO")
 		.unwrap();
 	dirigent
-		.schedule(
-			Box::new(TestProgram2 { name: "Test 2" }),
-			"Test 2",
-			Priority::Custom(2000),
-		)
+		.schedule(Box::new(TestProgram2 { name: "BAR" }), "BAR")
 		.unwrap();
 
 	let takt = dirigent.takt();
 	rt.spawn(async move {
 		let mut takt = takt;
-		takt.schedule_and_start(
-			Box::new(TestProgram2 { name: "Test 3" }),
-			"Test 3",
-			Priority::Middle,
-		)
-		.await
-		.unwrap();
 
-		takt.kill(Pid::new(2)).await.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(1)).await;
+		takt.kill(Pid::new(2)).await;
+		futures_timer::Delay::new(Duration::from_secs(5)).await;
+		takt.stop(Pid::new(1)).await.unwrap();
 	});
 
 	rt.block_on(async move {
 		dirigent.begin().await.unwrap();
 	});
+
+	tracing::info!("Finished main...");
 }
 
 #[test]
@@ -131,14 +170,14 @@ fn test_2() {
 	let mut dirigent = dirigent::Dirigent::<TestProgram2, _>::new(rt);
 
 	dirigent
-		.schedule(TestProgram2 { name: "Test 2" }, "Test 2", Priority::High)
+		.schedule(TestProgram2 { name: "Test 2" }, "Test 2")
 		.unwrap();
 	let takt = dirigent.takt();
 
 	let rt = Runtime::new().unwrap();
 	rt.spawn(async move {
 		let mut takt = takt;
-		takt.schedule_and_start(TestProgram2 { name: "Test 1" }, "Test 1", Priority::High)
+		takt.schedule_and_start(TestProgram2 { name: "Test 1" }, "Test 1")
 			.await
 			.unwrap();
 	});
