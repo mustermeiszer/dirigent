@@ -17,9 +17,11 @@
 
 const DEFAULT_CHANNEL_SIZE: usize = 512;
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum SendError<T> {
+	#[error("Sending failed. Channel is closed")]
 	Closed(T),
+	#[error("Sending failed. Channel is full")]
 	Full(T),
 }
 

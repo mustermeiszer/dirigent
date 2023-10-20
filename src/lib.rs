@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use core::ops::AddAssign;
-use std::{arch::aarch64::vcvtpd_u64_f64, time::Duration};
+use std::{arch::aarch64::vcvtpd_u64_f64, fmt::Debug, time::Duration};
 
 use futures::{future::BoxFuture, select, Future, FutureExt};
 use tracing::{error, info, trace, warn};
@@ -26,7 +26,7 @@ use tracing::{error, info, trace, warn};
 use crate::{
 	channel::{oneshot::channel, RecvError, SendError},
 	envelope::Envelope,
-	process::BusSignal,
+	process::{BusSignal, PidAllocation, Process, ProcessPool, Spawnable},
 	traits::{
 		ExitStatus, Index, Program, ScheduleExt, Scheduler, SchedulerRef, Spawner, TimeoutExt,
 	},
@@ -51,26 +51,6 @@ impl Pid {
 
 	pub fn id(&self) -> usize {
 		self.0
-	}
-}
-
-enum Activity<'a, P> {
-	Ready(P),
-	Playing(process::ProcessRef<'a>),
-}
-struct Instrum<'a, P> {
-	level: Activity<'a, P>,
-	pid: Pid,
-	name: &'static str,
-}
-
-impl<'a, P> Instrum<'a, P> {
-	fn new() -> Self {
-		todo!()
-	}
-
-	fn play(&mut self) -> Result<(), ()> {
-		todo!()
 	}
 }
 
@@ -121,20 +101,15 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 			spawner,
 			takt_to_dirigent_recv,
 		} = self;
-		let pid_allocaton = process::PidAllocation::new();
-		let (programs_to_bus_send, programs_to_bus_recv) = channel::mpsc::channel::<Envelope>();
-		let (bus_to_processes_send, bus_to_processes_recv) =
-			channel::spmc::channel::<process::BusSignal>();
-
-		let mut active_processes = Vec::<Instrum<P>>::new();
-		let mut scheduled_processes = Vec::<Instrum<P>>::new();
+		let mut pid_allocation = process::PidAllocation::new();
+		let mut process_pool = ProcessPool::new();
+		let mut scheduled_processes = Vec::<Spawnable<S::Handle, P>>::new();
 
 		loop {
 			// Serve commands first
 			select! {
 				cmd_res = takt_to_dirigent_recv.recv().fuse() => {
 					if let Ok(cmd) = cmd_res {
-						/*
 						match cmd {
 							Command::Schedule {
 								program,
@@ -158,33 +133,24 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 								// dereference it here
 								let program = unsafe { *Box::from_raw(program as *mut P) };
 
-								let instrum = Instrum {
-									program,
-									pid: pid_allocation.pid(),
-									name,
-								};
+								let pid = pid_allocation.pid();
+								let spawnable = Spawnable::new(pid, name, spawner.handle(), program);
 
 								trace!(
 									"Scheduled program {} [with {:?}]",
-									instrum.name,
-									instrum.pid,
+									name,
+									pid,
 								);
 
-								scheduled.push(instrum);
-								return_pid.send(pid_allocation.last()).await.unwrap();
-							}
-							Command::FetchRunning(return_pids) => {
-								let pids = running.iter().map(|active| active.pid).collect::<Vec<_>>();
-								if let Err(_) = return_pids.try_send(pids).await {
-									warn!("Receiver dropped. Could not send pids to requester.",)
-								}
+								scheduled_processes.push(spawnable);
+								drop_err(return_pid.send(pid).await);
 							}
 							Command::Start(pid) => {
 								if let Some(index) =
-									scheduled.iter().position(|instrum| instrum.pid == pid)
+									scheduled_processes.iter().position(|spawnable| spawnable.pid == pid)
 								{
-									let active = scheduled.swap_remove(index).play(&spawner);
-									running.push(active);
+									let scheduled = scheduled_processes.swap_remove(index);
+									process_pool.add(scheduled);
 								} else {
 									warn!(
 										"Could not start program with {:?}. Reason: Not scheduled.",
@@ -192,111 +158,13 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 									)
 								}
 							}
-							Command::Stop(pid) => {
-								if let Some(index) =
-									running.iter().position(|instrum| instrum.pid == pid)
-								{
-									running.swap_remove(index).shutdown();
-								} else {
-									warn!(
-										"Could not kill program with {:?}. Reason: Not running.",
-										pid
-									)
-								}
+							_ => {},
 							}
-							Command::Preempt(pid) => {
-								if let Some(index) =
-									running.iter().position(|instrum| instrum.pid == pid)
-								{
-									running
-										.get_mut(index)
-										.expect("Index is correct. qed.")
-										.preempt();
-								} else {
-									warn!(
-										"Could not preempt program with {:?}. Reason: Not running.",
-										pid
-									)
-								}
-							}
-							Command::Unpreempt(pid) => {
-								if let Some(index) =
-									running.iter().position(|instrum| instrum.pid == pid)
-								{
-									running
-										.get_mut(index)
-										.expect("Index is correct. qed.")
-										.schedule();
-								} else {
-									warn!(
-										"Could not preempt program with {:?}. Reason: Not running.",
-										pid
-									)
-								}
-							}
-							Command::Kill(pid) => {
-								if let Some(index) =
-									running.iter().position(|instrum| instrum.pid == pid)
-								{
-									running.swap_remove(index).kill();
-								} else {
-									warn!(
-										"Could not kill program with {:?}. Reason: Not running.",
-										pid
-									)
-								}
-							}
-							Command::ForceShutdown => {
-								info!("Force shutting down dirigent.");
-
-								running.iter_mut().for_each(|mut active| active.kill());
-								break;
-							}
-							Command::Shutdown => {
-								info!("Starting shutdown of dirigent...");
-
-								running.iter_mut().for_each(|mut active| active.shutdown());
-
-								// Allowing the rest of the system to shutdown
-								futures_timer::Delay::new(Duration::from_secs(
-									DEFAULT_SHUTDOWN_TIME_SECS,
-								))
-								.await;
-
-								info!("Stopping dirigent!");
-								break;
-						}
-					}
-					*/
 				} else {
 					warn!("All Takt instances dropped. Dirigent can no longer receive commands.");
 				}
 			}
-			bus_res	= programs_to_bus_recv.recv().fuse() => {
-				if let Ok(envelope) = bus_res {
-					if let Err(err) = bus_to_processes_send
-						.send(process::BusSignal::Message(envelope.clone()))
-						.await
-					{
-						match err {
-							SendError::Closed(_) => {
-								warn!("Sending to processes failed. Reason: Closed. Dropping message: {:?}", envelope);
-								error!("Channel to processes is closed. Fatal error. Shutting down.");
-								break;
-							}
-							SendError::Full(_) => {
-								warn!(
-									"Sending to processes failed. Reason: Full. Dropping message: {:?}",
-									envelope
-								);
-							}
-						}
-					}
-				} else {
-					// NOTE: Unreachable state as we always keep one sender here in this stack
-					unreachable!("One sender to bus is alwaus alive. qed.");
-				}
-			}
+			_ = process_pool.recv_all().fuse() => {}
 			}
 		}
 
@@ -305,7 +173,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 }
 
 #[derive(Clone)]
-struct Takt<P: Program> {
+pub struct Takt<P: Program> {
 	sender: channel::mpsc::Sender<Command<P>>,
 }
 
@@ -392,21 +260,38 @@ impl<P: Program> Takt<P> {
 	}
 }
 
-struct SubSpawner<Spawner> {
+pub struct SubSpawner<Spawner> {
 	parent_pid: Pid,
 	parent_name: &'static str,
-	scheduler_ref: SchedulerRef,
+	scheduler: Scheduler,
 	spawner: Spawner,
+	pid_allocation: PidAllocation,
 }
 
 impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
-	fn spawn_blocking(
+	fn new(
+		parent_pid: Pid,
+		parent_name: &'static str,
+		scheduler: Scheduler,
+		spawner: Spawner,
+		pid_allocation: PidAllocation,
+	) -> Self {
+		SubSpawner {
+			parent_pid,
+			parent_name,
+			scheduler,
+			spawner,
+			pid_allocation,
+		}
+	}
+
+	fn spawn_blocking_named(
 		&self,
 		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
 		pid: Pid,
 	) {
-		let future = future.schedule(self.scheduler_ref.clone());
+		let future = future.schedule(self.scheduler.reference());
 
 		let name = name.clone();
 		let parent_pid = self.parent_pid;
@@ -446,13 +331,13 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		self.spawner.spawn_blocking(future)
 	}
 
-	fn spawn(
+	fn spawn_named(
 		&self,
 		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
 		pid: Pid,
 	) {
-		let future = future.schedule(self.scheduler_ref.clone());
+		let future = future.schedule(self.scheduler.reference());
 
 		let name = name.clone();
 		let parent_pid = self.parent_pid;
@@ -490,5 +375,34 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		};
 
 		self.spawner.spawn(future)
+	}
+}
+
+impl<S: Spawner> Spawner for SubSpawner<S> {
+	type Handle = SubSpawner<S::Handle>;
+
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawn_blocking_named(future, "_sub_blocking", self.pid_allocation.pid())
+	}
+
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawn_named(future, "_sub", self.pid_allocation.pid())
+	}
+
+	fn handle(&self) -> Self::Handle {
+		SubSpawner {
+			parent_name: self.parent_name,
+			parent_pid: self.parent_pid,
+			spawner: self.spawner.handle(),
+			scheduler: self.scheduler.clone(),
+			pid_allocation: self.pid_allocation.clone(),
+		}
+	}
+}
+
+fn drop_err<T, E: Debug>(res: Result<T, E>) {
+	match res {
+		Ok(_) => {}
+		Err(e) => warn!("Received error: {:?}", e),
 	}
 }

@@ -15,14 +15,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{ops::AddAssign, sync::Arc};
+use std::sync::{
+	atomic::{AtomicUsize, Ordering},
+	Arc,
+};
 
-use futures::{future::BoxFuture, select, FutureExt};
+use futures::future::{select_all, BoxFuture};
 use tracing::{error, trace, warn};
 
 use crate::{
 	channel,
-	channel::{mpsc, spmc, spsc, RecvError},
+	channel::{mpsc, oneshot, RecvError},
 	envelope::Envelope,
 	traits,
 	traits::{
@@ -31,19 +34,15 @@ use crate::{
 	Pid, SubSpawner,
 };
 
-pub struct PidAllocation(usize);
+#[derive(Clone)]
+pub struct PidAllocation(Arc<AtomicUsize>);
 impl PidAllocation {
 	pub fn new() -> PidAllocation {
-		PidAllocation(0)
+		PidAllocation(Arc::new(AtomicUsize::new(1)))
 	}
 
-	pub fn last(&self) -> Pid {
-		Pid(self.0)
-	}
-
-	pub fn pid(&mut self) -> Pid {
-		self.0.add_assign(1);
-		Pid(self.0)
+	pub fn pid(&self) -> Pid {
+		Pid(self.0.fetch_add(1, Ordering::SeqCst))
 	}
 }
 
@@ -55,10 +54,6 @@ pub enum ProcessSignal {
 	UnPreempt,
 }
 
-pub enum ProgramSignal {
-	SetIndex(Box<dyn Index>),
-}
-
 pub enum BusSignal {
 	Process(Pid, ProcessSignal),
 	All(ProcessSignal),
@@ -66,16 +61,230 @@ pub enum BusSignal {
 	Messages(Arc<Vec<Envelope>>),
 }
 
-pub struct ProcessRef<'a> {
-	pid: Pid,
-	bus_to_process_send: &'a spmc::Sender<BusSignal>,
+pub struct ProcessPool<S: Spawner> {
+	processes: Vec<Process<SPS<S>>>,
+}
+
+impl<S: Spawner> ProcessPool<S> {
+	pub fn new() -> Self {
+		ProcessPool {
+			processes: Vec::new(),
+		}
+	}
+
+	pub fn add<P: Program>(&mut self, spawnable: Spawnable<S, P>) {
+		self.processes.push(spawnable.spawn());
+	}
+
+	pub async fn recv_all(&self) {
+		let all = select_all(
+			self.processes
+				.iter()
+				.map(|process| Box::pin(process.0.program_to_bus_recv.recv()))
+				.collect::<Vec<_>>(),
+		);
+
+		let (res, _index, remaining) = all.await;
+	}
+}
+
+type SPS<S> = SubSpawner<<<S as Spawner>::Handle as Spawner>::Handle>;
+pub struct Spawnable<S, P> {
+	/// The process ID of this process.
+	/// Unique for every process run by an dirigent instance
+	pub pid: Pid,
+
+	/// The name of the program this process is controlling
+	pub name: &'static str,
+
+	spawner: S,
+
+	program: P,
+}
+
+impl<P: Program, S: Spawner> Spawnable<S, P> {
+	pub fn new(pid: Pid, name: &'static str, spawner: S, program: P) -> Self
+	where
+		P: Program,
+	{
+		Spawnable {
+			pid,
+			name,
+			spawner,
+			program,
+		}
+	}
+
+	pub fn spawn(self) -> Process<SubSpawner<<<S as Spawner>::Handle as Spawner>::Handle>> {
+		let mut scheduler = Scheduler::new(self.pid);
+		let sub_spawner = SubSpawner::new(
+			self.pid,
+			self.name,
+			scheduler.clone(),
+			self.spawner.handle(),
+			PidAllocation::new(),
+		);
+
+		let (program_to_bus_send, program_to_bus_recv) = mpsc::channel();
+		let (context, process_to_program_send) = Context::new(
+			self.pid,
+			self.name,
+			sub_spawner.handle(),
+			program_to_bus_send,
+		);
+		let scheduler_ref = scheduler.reference();
+		let process = Process::new(
+			self.pid,
+			self.name,
+			sub_spawner.handle(),
+			scheduler,
+			process_to_program_send,
+			program_to_bus_recv,
+		);
+		let process_ref = process.clone();
+
+		let (index_registry_send, index_registry_recv) = oneshot::channel();
+		sub_spawner.spawn(async move {
+			if let Ok(index) = index_registry_recv.recv().await {
+				process_ref.set_index(index);
+				Ok(())
+			} else {
+				error!(
+					"Pid: {:?}. Index registry oneshot failed receiving",
+					self.pid
+				);
+				Err(InstanceError::Unexpected)
+			}
+		});
+
+		let program = Box::new(self.program)
+			.start(Box::new(context), IndexRegistry::new(index_registry_send))
+			.schedule(scheduler_ref);
+
+		self.spawner.spawn(async move {
+			let res = program.await;
+
+			match res {
+				Err(e) => {
+					warn!(
+						"Process {} [{:?}], exited with error: {:?}",
+						self.name, self.pid, e
+					)
+				}
+				Ok(inner_res) => {
+					if let Err(e) = inner_res {
+						warn!(
+							"Process {} [{:?}]exited with error: {:?}",
+							self.name, self.pid, e
+						)
+					} else {
+						trace!("Process {} [{:?}] finished.", self.name, self.pid)
+					}
+				}
+			}
+
+			Ok(())
+		});
+
+		process
+	}
+}
+
+pub struct Process<S>(Arc<InnerProcess<S>>);
+
+impl<S> Clone for Process<S> {
+	fn clone(&self) -> Self {
+		Process(self.0.clone())
+	}
+}
+
+impl<S: Spawner> Process<S> {
+	fn inner_mut(&self) -> &mut InnerProcess<S> {
+		let raw = self.0.as_ref() as *const InnerProcess<S> as *mut InnerProcess<S>;
+
+		unsafe { &mut *raw }
+	}
+
+	fn set_index(&self, index: Arc<dyn Index>) {
+		self.inner_mut().index = Some(index);
+	}
+
+	pub fn consume<C>(&self, envelope: Envelope, call_back: C)
+	where
+		C: FnOnce(&ExitStatus) + Send + 'static,
+	{
+		if let Some(ref index) = self.0.index {
+			let process_ref = self.clone();
+			let index = index.clone();
+
+			self.0.spawner.spawn(async move {
+				let res = if index.indexed(&envelope) {
+					process_ref
+						.0
+						.process_to_program_send
+						.send(envelope.clone())
+						.await
+						.map_err(|err| {
+							error!(
+								"Failed sending to program {} [{:?}]. Enveloped missed: {:?}",
+								process_ref.0.name, process_ref.0.pid, envelope
+							);
+
+							InstanceError::Internal(Box::new(err))
+						})
+				} else {
+					Ok(())
+				};
+
+				call_back(&res);
+
+				res
+			});
+		}
+	}
+
+	pub fn consume_all<C>(&self, envelopes: Arc<Vec<Envelope>>, call_back: C)
+	where
+		C: Fn(&ExitStatus) + Send + 'static,
+	{
+		if let Some(ref index) = self.0.index {
+			let process_ref = self.clone();
+			let index = index.clone();
+
+			self.0.spawner.spawn(async move {
+				for envelope in envelopes.as_ref() {
+					let res = if index.indexed(&envelope) {
+						process_ref
+							.0
+							.process_to_program_send
+							.send(envelope.clone())
+							.await
+							.map_err(|err| {
+								error!(
+									"Failed sending to program {} [{:?}]. Enveloped missed: {:?}",
+									process_ref.0.name, process_ref.0.pid, envelope
+								);
+
+								InstanceError::Internal(Box::new(err))
+							})
+					} else {
+						Ok(())
+					};
+
+					call_back(&res);
+				}
+
+				Ok(())
+			});
+		}
+	}
 }
 
 /// A process is spawned by dirigent and provides all means to control a given
 /// program. It provides means to
 /// * communicate with the program
 /// * receive messages from the bus
-pub struct Process<S> {
+struct InnerProcess<S> {
 	/// The process ID of this process.
 	/// Unique for every process run by an dirigent instance
 	pid: Pid,
@@ -83,160 +292,53 @@ pub struct Process<S> {
 	/// The name of the program this process is controlling
 	name: &'static str,
 
-	/// Signals from the bus for the process
-	bus_to_process_recv: spmc::Receiver<BusSignal>,
-
 	/// Signals from the process for the program
-	process_to_program_send: spsc::Sender<Envelope>,
+	process_to_program_send: mpsc::Sender<Envelope>,
 
-	/// Signal from the program for the process
-	/// Only used once for receiving the index.
-	program_to_process_recv: spsc::Receiver<ProgramSignal>,
+	/// Signals from the program to the bus
+	program_to_bus_recv: mpsc::Receiver<Envelope>,
 
 	/// The index of the program.
 	/// * filters messages received from bus
 	/// * indexed messages are forwarded to the program
-	index: Option<Box<dyn Index>>,
+	index: Option<Arc<dyn Index>>,
 
 	/// The scheduler for all state-machines spawned from this process
 	scheduler: Scheduler,
 
 	/// Spawner
 	spawner: S,
-
-	// NOTE: This field is only set intermediary, when a process is generated but not yet
-	//       spawned
-	_program_state_machine: Option<BoxFuture<'static, ExitStatus>>,
 }
 
+unsafe impl<S: Send> Send for Process<S> {}
+unsafe impl<S: Sync> Sync for Process<S> {}
+
 impl<S: Spawner> Process<S> {
-	pub fn new<'a, P>(
+	pub fn new(
 		pid: Pid,
 		name: &'static str,
 		spawner: S,
-		program: P,
-		bus_to_process_send: &'a spmc::Sender<BusSignal>,
-		bus_to_process_recv: spmc::Receiver<BusSignal>,
-		program_to_bus_send: mpsc::Sender<Envelope>,
-	) -> Result<(Self, ProcessRef<'a>), ()>
-	where
-		P: Program,
-	{
-		let (context, mut scheduler, process_to_program_send) =
-			Context::new(pid, name, spawner.handle(), program_to_bus_send);
-		let (program_to_process_send, program_to_process_recv) = spsc::channel();
-		let process = Box::new(program)
-			.start(
-				Box::new(context),
-				IndexRegistry::new(program_to_process_send),
-			)
-			.schedule(scheduler.reference());
-
-		let _program_state_machine: Option<BoxFuture<ExitStatus>> = Some(Box::pin(async move {
-			let res = process.await;
-
-			match res {
-				Err(e) => {
-					warn!("Process {} [{:?}], exited with error: {:?}", name, pid, e)
-				}
-				Ok(inner_res) => {
-					if let Err(e) = inner_res {
-						warn!("Process {} [{:?}]exited with error: {:?}", name, pid, e)
-					} else {
-						trace!("Process {} [{:?}] finished.", name, pid,)
-					}
-				}
-			}
-
-			Ok(())
-		}));
-
-		Ok((
-			Process {
-				pid,
-				name,
-				bus_to_process_recv,
-				process_to_program_send,
-				program_to_process_recv,
-				index: None,
-				scheduler,
-				spawner,
-				_program_state_machine,
-			},
-			ProcessRef {
-				pid,
-				bus_to_process_send,
-			},
-		))
-	}
-
-	pub async fn spawn(mut self) -> ExitStatus {
-		// Spawning the program first
-		self.spawner.spawn(
-			self._program_state_machine
-				.expect("Program is set during new(). qed."),
-		);
-
-		loop {
-			select! {
-				index_res = self.program_to_process_recv.recv().fuse() => {
-					if let Ok(sig) = index_res {
-						match sig {
-							ProgramSignal::SetIndex(index) => self.index = Some(index),
-						}
-					} else {
-						error!("Program not able to communicate with process. Killing program.");
-						return Err(InstanceError::Unexpected);
-
-					}
-				},
-				bus_res = self.bus_to_process_recv.recv().fuse() => {
-					if let Ok(sig) = bus_res {
-						match sig {
-							BusSignal::Message(env) => {
-								if let Some(index) = &self.index {
-									// Process messages
-								}
-							}
-							BusSignal::Messages(envs) => {
-								if let Some(index) = &self.index {
-									// Process messages
-								}
-							}
-							BusSignal::Process(pid, sig) if pid == self.pid => {
-								// Process signal
-								match sig {
-									ProcessSignal::Stop => {}
-									ProcessSignal::Kill => {}
-									ProcessSignal::Preempt => {}
-									ProcessSignal::UnPreempt => {}
-								}
-							}
-							BusSignal::Process(_, _) => {},
-							BusSignal::All(sig) => {
-							// Process signal
-								match sig {
-									ProcessSignal::Stop => {}
-									ProcessSignal::Kill => {}
-									ProcessSignal::Preempt => {}
-									ProcessSignal::UnPreempt => {}
-								}
-							}
-						}
-					} else {
-						error!("Program not able to communicate with bus. Killing program.");
-						return Err(InstanceError::Unexpected);
-					}
-				}
-			};
-		}
+		scheduler: Scheduler,
+		process_to_program_send: mpsc::Sender<Envelope>,
+		program_to_bus_recv: mpsc::Receiver<Envelope>,
+	) -> Self {
+		Process(Arc::new(InnerProcess {
+			pid,
+			name,
+			spawner,
+			scheduler,
+			process_to_program_send,
+			program_to_bus_recv,
+			index: None,
+		}))
 	}
 }
 
 pub struct Context<Spawner> {
-	spawner: SubSpawner<Spawner>,
-	sub_pid_allocation: PidAllocation,
-	from_process: spsc::Receiver<Envelope>,
+	pid: Pid,
+	name: &'static str,
+	spawner: Spawner,
+	from_process: mpsc::Receiver<Envelope>,
 	to_bus: mpsc::Sender<Envelope>,
 }
 
@@ -246,23 +348,18 @@ impl<Handle: Spawner> Context<Handle> {
 		name: &'static str,
 		spawner: Handle,
 		program_to_bus_send: mpsc::Sender<Envelope>,
-	) -> (Self, Scheduler, spsc::Sender<Envelope>) {
-		let mut scheduler = Scheduler::new(pid);
-		let (process_to_program_send, process_to_program_recv) = spsc::channel();
+	) -> (Self, mpsc::Sender<Envelope>) {
+		let (process_to_program_send, process_to_program_recv) = mpsc::channel();
 
 		let ctx = Context {
-			sub_pid_allocation: PidAllocation::new(),
-			spawner: SubSpawner {
-				parent_name: name.clone(),
-				parent_pid: pid,
-				scheduler_ref: scheduler.reference(),
-				spawner: spawner,
-			},
+			pid,
+			name,
+			spawner,
 			from_process: process_to_program_recv,
 			to_bus: program_to_bus_send,
 		};
 
-		(ctx, scheduler, process_to_program_send)
+		(ctx, process_to_program_send)
 	}
 }
 
@@ -291,20 +388,11 @@ where
 		self.to_bus.clone()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>, name: Option<&'static str>) {
-		// TODO: Possible to concat with parent name?
-		let name = name.unwrap_or("_sub");
-		self.spawner.spawn(sub, name, self.sub_pid_allocation.pid())
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		self.spawner.spawn(sub)
 	}
 
-	fn spawn_sub_blocking(
-		&mut self,
-		sub: BoxFuture<'static, ExitStatus>,
-		name: Option<&'static str>,
-	) {
-		// TODO: Possible to concat with parent name?
-		let name = name.unwrap_or("_sub_blocking");
-		self.spawner
-			.spawn_blocking(sub, name, self.sub_pid_allocation.pid())
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		self.spawner.spawn_blocking(sub)
 	}
 }

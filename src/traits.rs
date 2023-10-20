@@ -21,19 +21,19 @@ use std::{
 	pin::Pin,
 	sync::{
 		atomic::{AtomicBool, AtomicUsize, Ordering},
-		Arc,
+		Arc, Mutex,
 	},
 	task::Poll,
 	time::Duration,
 };
 
 use futures::future::{BoxFuture, Future};
+use tracing::error;
 
 use crate::{
 	channel,
 	channel::{RecvError, SendError},
 	envelope::Envelope,
-	process::ProgramSignal,
 	Pid,
 };
 
@@ -85,15 +85,17 @@ impl Index for EmptyIndex {
 	}
 }
 
-pub struct IndexRegistry(channel::spsc::Sender<ProgramSignal>);
+pub struct IndexRegistry(channel::oneshot::Sender<Arc<dyn Index>>);
 
 impl IndexRegistry {
-	pub fn new(sender: channel::spsc::Sender<ProgramSignal>) -> Self {
+	pub fn new(sender: channel::oneshot::Sender<Arc<dyn Index>>) -> Self {
 		IndexRegistry(sender)
 	}
 
-	pub async fn register(self, index: Box<dyn Index>) {
-		self.0.send(ProgramSignal::SetIndex(index)).await;
+	pub async fn register(self, index: Arc<dyn Index>) {
+		if let Err(_) = self.0.send(index).await {
+			error!("IndexRegistry was unable to set Index. Receiver has been dropped.");
+		}
 	}
 }
 
@@ -121,13 +123,9 @@ pub trait Context: Send + 'static {
 
 	fn sender(&self) -> channel::mpsc::Sender<Envelope>;
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>, name: Option<&'static str>);
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>);
 
-	fn spawn_sub_blocking(
-		&mut self,
-		sub: BoxFuture<'static, ExitStatus>,
-		name: Option<&'static str>,
-	);
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>);
 }
 
 #[async_trait::async_trait]
@@ -152,16 +150,12 @@ impl Context for Box<dyn Context> {
 		(**self).sender()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>, name: Option<&'static str>) {
-		(**self).spawn_sub(sub, name)
+	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		(**self).spawn_sub(sub)
 	}
 
-	fn spawn_sub_blocking(
-		&mut self,
-		sub: BoxFuture<'static, ExitStatus>,
-		name: Option<&'static str>,
-	) {
-		(**self).spawn_sub_blocking(sub, name)
+	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+		(**self).spawn_sub_blocking(sub)
 	}
 }
 
@@ -189,9 +183,10 @@ const RUNNING: usize = 0b0001;
 const SHUTDOWN: usize = 0b0010;
 const KILLED: usize = 0b0100;
 
+#[derive(Clone)]
 pub struct Scheduler {
 	pid: Pid,
-	states: Vec<Arc<Inner>>,
+	states: Arc<Mutex<Vec<Arc<Inner>>>>,
 }
 
 struct Inner {
@@ -201,33 +196,42 @@ struct Inner {
 }
 
 impl Scheduler {
-	pub fn waking(&mut self) {
-		tracing::debug!("Trying waking for all of {:?}...", self.pid);
-
-		for instance in &mut self.states {
-			instance.waker.wake()
+	fn on_states(&self, f: impl FnOnce(&mut Vec<Arc<Inner>>)) {
+		match self.states.lock() {
+			Ok(mut guard) => f(guard.as_mut()),
+			Err(_) => panic!("Scheduler lock poisoned. Unrecoverable error."),
 		}
 	}
 
+	pub fn waking(&mut self) {
+		tracing::debug!("Trying waking for all of {:?}...", self.pid);
+
+		self.on_states(|states| {
+			for instance in states {
+				instance.waker.wake()
+			}
+		})
+	}
+
 	pub fn cleaning(&mut self) {
-		self.states
-			.retain(|inner| !inner.dead.load(Ordering::Relaxed))
+		self.on_states(|states| states.retain(|inner| !inner.dead.load(Ordering::Relaxed)))
 	}
 
 	pub fn new(pid: Pid) -> Scheduler {
 		Scheduler {
-			states: Vec::new(),
+			states: Arc::new(Mutex::new(Vec::new())),
 			pid,
 		}
 	}
 
-	pub fn reference(&mut self) -> SchedulerRef {
+	pub fn reference(&self) -> SchedulerRef {
 		let inner = Arc::new(Inner {
 			waker: atomic_waker::AtomicWaker::new(),
 			state: AtomicUsize::new(RUNNING),
 			dead: AtomicBool::new(false),
 		});
-		self.states.push(inner.clone());
+
+		self.on_states(|states| states.push(inner.clone()));
 
 		SchedulerRef {
 			inner,
@@ -237,72 +241,78 @@ impl Scheduler {
 
 	pub fn kill(&mut self) {
 		let mut count = 0usize;
-		self.states.retain(|instance| {
-			count += 1;
+		self.on_states(|states| {
+			states.retain(|instance| {
+				count += 1;
+				let not_dead = !instance.dead.load(Ordering::SeqCst);
+				if not_dead {
+					instance.state.store(KILLED, Ordering::Relaxed);
+					instance.dead.store(true, Ordering::Relaxed);
+					tracing::debug!("Waking instance {} of {:?} for killing", count, self.pid);
+					instance.waker.wake()
+				}
 
-			let not_dead = !instance.dead.load(Ordering::SeqCst);
-			if not_dead {
-				instance.state.store(KILLED, Ordering::Relaxed);
-				instance.dead.store(true, Ordering::Relaxed);
-				tracing::debug!("Waking instance {} of {:?} for killing", count, self.pid);
-				instance.waker.wake()
-			}
-
-			not_dead
-		});
+				not_dead
+			});
+		})
 	}
 
 	pub fn preempt(&mut self) {
 		let mut count = 0usize;
-		self.states.retain(|instance| {
-			count += 1;
+		self.on_states(|states| {
+			states.retain(|instance| {
+				count += 1;
 
-			let not_dead = !instance.dead.load(Ordering::SeqCst);
-			if not_dead {
-				instance.state.store(PREEMPTED, Ordering::Relaxed);
-				tracing::debug!("Waking {:?} for Preemption", self.pid);
-				instance.waker.wake()
-			}
+				let not_dead = !instance.dead.load(Ordering::SeqCst);
+				if not_dead {
+					instance.state.store(PREEMPTED, Ordering::Relaxed);
+					tracing::debug!("Waking {:?} for Preemption", self.pid);
+					instance.waker.wake()
+				}
 
-			not_dead
-		});
+				not_dead
+			});
+		})
 	}
 
 	pub fn schedule(&mut self) {
 		let mut count = 0usize;
-		self.states.retain(|instance| {
-			count += 1;
+		self.on_states(|states| {
+			states.retain(|instance| {
+				count += 1;
 
-			let not_dead = !instance.dead.load(Ordering::SeqCst);
-			if not_dead {
-				instance.state.store(RUNNING, Ordering::Relaxed);
-				tracing::debug!("Waking {:?} for Running", self.pid);
-				instance.waker.wake()
-			}
+				let not_dead = !instance.dead.load(Ordering::SeqCst);
+				if not_dead {
+					instance.state.store(RUNNING, Ordering::Relaxed);
+					tracing::debug!("Waking {:?} for Running", self.pid);
+					instance.waker.wake()
+				}
 
-			not_dead
-		});
+				not_dead
+			});
+		})
 	}
 
 	pub fn shutdown(&mut self) {
 		let mut count = 0usize;
-		self.states.retain(|instance| {
-			count += 1;
+		self.on_states(|states| {
+			states.retain(|instance| {
+				count += 1;
 
-			let not_dead = !instance.dead.load(Ordering::SeqCst);
-			if not_dead {
-				instance.state.store(SHUTDOWN, Ordering::Relaxed);
-				instance.dead.store(true, Ordering::Relaxed);
-				tracing::debug!("Waking {:?} for Shutdown", self.pid);
-				instance.waker.wake()
-			}
+				let not_dead = !instance.dead.load(Ordering::SeqCst);
+				if not_dead {
+					instance.state.store(SHUTDOWN, Ordering::Relaxed);
+					instance.dead.store(true, Ordering::Relaxed);
+					tracing::debug!("Waking {:?} for Shutdown", self.pid);
+					instance.waker.wake()
+				}
 
-			not_dead
-		});
+				not_dead
+			});
+		})
 	}
 }
 
-#[derive(Clone)]
 pub struct SchedulerRef {
 	inner: Arc<Inner>,
 	pid: Pid,
@@ -319,10 +329,9 @@ impl SchedulerRef {
 		}
 	}
 
-	fn register_waker(&mut self, waker: &futures::task::Waker) -> Result<(), InstanceError> {
+	fn register_waker(&mut self, waker: &futures::task::Waker) {
 		tracing::trace!("Registering waker {:?} for {:?}.", waker, self.pid);
 		self.inner.waker.register(waker);
-		Ok(())
 	}
 }
 
@@ -390,7 +399,7 @@ where
 						.shutdown_timer
 						.get_mut()
 						.as_mut()
-						.map(|mut timer| {
+						.map(|timer| {
 							tracing::debug!("Shutdown. Pooling timer for {:?}", this.scheduler.pid);
 							unsafe { Pin::new_unchecked(timer) }.poll(ctx).is_ready()
 						})
@@ -587,6 +596,7 @@ mod atomic_waker {
 		/// }
 		/// ```
 		pub fn register(&self, waker: &Waker) {
+			#[allow(deprecated)]
 			match self.state.compare_and_swap(WAITING, REGISTERING, Acquire) {
 				WAITING => {
 					unsafe {
