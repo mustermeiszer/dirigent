@@ -121,7 +121,7 @@ pub trait Context: Send + 'static {
 
 	fn try_send(&self, envelope: Envelope) -> Result<(), SendError<Envelope>>;
 
-	fn sender(&self) -> channel::mpsc::Sender<Envelope>;
+	fn sender(&self) -> channel::mpmc::Sender<Envelope>;
 
 	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>);
 
@@ -146,7 +146,7 @@ impl Context for Box<dyn Context> {
 		(**self).try_send(envelope)
 	}
 
-	fn sender(&self) -> channel::mpsc::Sender<Envelope> {
+	fn sender(&self) -> channel::mpmc::Sender<Envelope> {
 		(**self).sender()
 	}
 

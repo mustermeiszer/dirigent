@@ -17,19 +17,15 @@
 
 #![allow(dead_code)]
 
-use core::ops::AddAssign;
-use std::{arch::aarch64::vcvtpd_u64_f64, fmt::Debug, time::Duration};
+use std::fmt::Debug;
 
-use futures::{future::BoxFuture, select, Future, FutureExt};
-use tracing::{error, info, trace, warn};
+use futures::{select, Future, FutureExt};
+use tracing::{trace, warn};
 
 use crate::{
-	channel::{oneshot::channel, RecvError, SendError},
-	envelope::Envelope,
-	process::{BusSignal, PidAllocation, Process, ProcessPool, Spawnable},
-	traits::{
-		ExitStatus, Index, Program, ScheduleExt, Scheduler, SchedulerRef, Spawner, TimeoutExt,
-	},
+	channel::{mpmc, oneshot::channel},
+	process::{PidAllocation, ProcessPool, Spawnable},
+	traits::{ExitStatus, Program, ScheduleExt, Scheduler, Spawner},
 };
 
 pub mod channel;
@@ -101,8 +97,9 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 			spawner,
 			takt_to_dirigent_recv,
 		} = self;
-		let mut pid_allocation = process::PidAllocation::new();
-		let mut process_pool = ProcessPool::new();
+		let pid_allocation = process::PidAllocation::new();
+		let (program_to_bus_send, program_to_bus_recv) = mpmc::channel();
+		let mut process_pool = ProcessPool::new(program_to_bus_recv);
 		let mut scheduled_processes = Vec::<Spawnable<S::Handle, P>>::new();
 
 		loop {
@@ -134,7 +131,7 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 								let program = unsafe { *Box::from_raw(program as *mut P) };
 
 								let pid = pid_allocation.pid();
-								let spawnable = Spawnable::new(pid, name, spawner.handle(), program);
+								let spawnable = Spawnable::new(pid, name, spawner.handle(), program, program_to_bus_send.clone());
 
 								trace!(
 									"Scheduled program {} [with {:?}]",
@@ -164,11 +161,9 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 					warn!("All Takt instances dropped. Dirigent can no longer receive commands.");
 				}
 			}
-			_ = process_pool.recv_all().fuse() => {}
+			_ = process_pool.recv().fuse() => {}
 			}
 		}
-
-		Ok(())
 	}
 }
 

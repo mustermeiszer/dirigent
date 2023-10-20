@@ -20,12 +20,12 @@ use std::sync::{
 	Arc,
 };
 
-use futures::future::{select_all, BoxFuture};
+use futures::future::BoxFuture;
 use tracing::{error, trace, warn};
 
 use crate::{
 	channel,
-	channel::{mpsc, oneshot, RecvError},
+	channel::{mpmc, mpsc, oneshot, RecvError},
 	envelope::Envelope,
 	traits,
 	traits::{
@@ -61,13 +61,17 @@ pub enum BusSignal {
 	Messages(Arc<Vec<Envelope>>),
 }
 
+const MAX_RECEIVED: usize = 100;
+
 pub struct ProcessPool<S: Spawner> {
+	program_to_bus_recv: mpmc::Receiver<Envelope>,
 	processes: Vec<Process<SPS<S>>>,
 }
 
 impl<S: Spawner> ProcessPool<S> {
-	pub fn new() -> Self {
+	pub fn new(program_to_bus_recv: mpmc::Receiver<Envelope>) -> Self {
 		ProcessPool {
+			program_to_bus_recv,
 			processes: Vec::new(),
 		}
 	}
@@ -76,15 +80,35 @@ impl<S: Spawner> ProcessPool<S> {
 		self.processes.push(spawnable.spawn());
 	}
 
-	pub async fn recv_all(&self) {
-		let all = select_all(
-			self.processes
-				.iter()
-				.map(|process| Box::pin(process.0.program_to_bus_recv.recv()))
-				.collect::<Vec<_>>(),
-		);
+	pub async fn recv(&self) {
+		let max_tries = core::cmp::min(MAX_RECEIVED, self.processes.len());
+		let mut received = Vec::with_capacity(max_tries);
 
-		let (res, _index, remaining) = all.await;
+		if let Ok(envelope) = self.program_to_bus_recv.recv().await {
+			received.push(envelope);
+
+			for _ in 0..max_tries {
+				if let Ok(maybe_envelope) = self.program_to_bus_recv.try_recv() {
+					if let Some(envelope) = maybe_envelope {
+						received.push(envelope);
+					} else {
+						break;
+					}
+				} else {
+					error!("Bus is broken. Aborting.");
+					panic!()
+				}
+			}
+		} else {
+			error!("Bus is broken. Aborting.");
+			panic!()
+		}
+
+		let received = Arc::new(received);
+
+		self.processes
+			.iter()
+			.for_each(|process| process.consume_all(received.clone(), |_res| {}))
 	}
 }
 
@@ -100,10 +124,18 @@ pub struct Spawnable<S, P> {
 	spawner: S,
 
 	program: P,
+
+	program_to_bus_send: mpmc::Sender<Envelope>,
 }
 
 impl<P: Program, S: Spawner> Spawnable<S, P> {
-	pub fn new(pid: Pid, name: &'static str, spawner: S, program: P) -> Self
+	pub fn new(
+		pid: Pid,
+		name: &'static str,
+		spawner: S,
+		program: P,
+		program_to_bus_send: mpmc::Sender<Envelope>,
+	) -> Self
 	where
 		P: Program,
 	{
@@ -112,11 +144,12 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			name,
 			spawner,
 			program,
+			program_to_bus_send,
 		}
 	}
 
 	pub fn spawn(self) -> Process<SubSpawner<<<S as Spawner>::Handle as Spawner>::Handle>> {
-		let mut scheduler = Scheduler::new(self.pid);
+		let scheduler = Scheduler::new(self.pid);
 		let sub_spawner = SubSpawner::new(
 			self.pid,
 			self.name,
@@ -125,12 +158,11 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			PidAllocation::new(),
 		);
 
-		let (program_to_bus_send, program_to_bus_recv) = mpsc::channel();
 		let (context, process_to_program_send) = Context::new(
 			self.pid,
 			self.name,
 			sub_spawner.handle(),
-			program_to_bus_send,
+			self.program_to_bus_send,
 		);
 		let scheduler_ref = scheduler.reference();
 		let process = Process::new(
@@ -139,7 +171,6 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			sub_spawner.handle(),
 			scheduler,
 			process_to_program_send,
-			program_to_bus_recv,
 		);
 		let process_ref = process.clone();
 
@@ -295,9 +326,6 @@ struct InnerProcess<S> {
 	/// Signals from the process for the program
 	process_to_program_send: mpsc::Sender<Envelope>,
 
-	/// Signals from the program to the bus
-	program_to_bus_recv: mpsc::Receiver<Envelope>,
-
 	/// The index of the program.
 	/// * filters messages received from bus
 	/// * indexed messages are forwarded to the program
@@ -320,7 +348,6 @@ impl<S: Spawner> Process<S> {
 		spawner: S,
 		scheduler: Scheduler,
 		process_to_program_send: mpsc::Sender<Envelope>,
-		program_to_bus_recv: mpsc::Receiver<Envelope>,
 	) -> Self {
 		Process(Arc::new(InnerProcess {
 			pid,
@@ -328,7 +355,6 @@ impl<S: Spawner> Process<S> {
 			spawner,
 			scheduler,
 			process_to_program_send,
-			program_to_bus_recv,
 			index: None,
 		}))
 	}
@@ -339,7 +365,7 @@ pub struct Context<Spawner> {
 	name: &'static str,
 	spawner: Spawner,
 	from_process: mpsc::Receiver<Envelope>,
-	to_bus: mpsc::Sender<Envelope>,
+	to_bus: mpmc::Sender<Envelope>,
 }
 
 impl<Handle: Spawner> Context<Handle> {
@@ -347,7 +373,7 @@ impl<Handle: Spawner> Context<Handle> {
 		pid: Pid,
 		name: &'static str,
 		spawner: Handle,
-		program_to_bus_send: mpsc::Sender<Envelope>,
+		program_to_bus_send: mpmc::Sender<Envelope>,
 	) -> (Self, mpsc::Sender<Envelope>) {
 		let (process_to_program_send, process_to_program_recv) = mpsc::channel();
 
@@ -384,7 +410,7 @@ where
 		self.to_bus.try_send(envelope)
 	}
 
-	fn sender(&self) -> mpsc::Sender<Envelope> {
+	fn sender(&self) -> mpmc::Sender<Envelope> {
 		self.to_bus.clone()
 	}
 
