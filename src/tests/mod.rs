@@ -3,7 +3,7 @@
 // Copyright (C) Frederik Gartenmeister.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{task::Poll, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use std::{task::Poll, time::Duration};
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
-	traits::{Context, ExitStatus, Index, Program},
+	traits::{Context, ExitStatus, Index, IndexRegistry, Program},
 	Pid,
 };
 
@@ -32,50 +32,24 @@ struct Message {
 impl dirigent::traits::Message for Message {}
 
 #[derive(Clone, Debug)]
-struct TestProgram1;
-#[async_trait::async_trait]
-impl dirigent::traits::Program for TestProgram1 {
-	async fn start(self: Box<Self>, mut ctx: Box<dyn Context>) -> ExitStatus {
-		tracing::info!("Hello, World from Test Programm 1!");
-
-		let msg = Message {
-			from: "Programm 1".to_string(),
-			text: "Hello From Program 1".to_string(),
-		};
-		if let Err(e) = ctx.send(msg.into()).await {
-			tracing::error!("Program 1: Could not send, {:?}", e)
-		};
-
-		loop {
-			match ctx.try_recv().await {
-				Ok(envelope) => {
-					if let Some(envelope) = envelope {
-						envelope.try_read_ref::<Message, _, _>(|msg| {
-							tracing::info!("Program 1 received: {}", msg.text)
-						});
-					}
-				}
-				Err(_e) => {
-					//tracing::error!("Program 1: Could not recv, {:?}", e)
-				}
-			}
-
-			//futures_timer::Delay::new(Duration::from_secs(3)).await;
-		}
-
-		Ok(())
-	}
-}
-
-#[derive(Clone, Debug)]
-struct TestProgram2 {
+struct TestProgram {
 	name: &'static str,
 }
 
 #[async_trait::async_trait]
-impl dirigent::traits::Program for TestProgram2 {
-	async fn start(self: Box<Self>, mut ctx: Box<dyn Context>) -> ExitStatus {
+impl dirigent::traits::Program for TestProgram {
+	async fn start(
+		self: Box<Self>,
+		mut ctx: Box<dyn Context>,
+		registry: Box<dyn IndexRegistry>,
+	) -> ExitStatus {
 		tracing::info!("Hello, World from Test Programm {}!", self.name);
+
+		tracing::info!("Programm {}, registering index...", self.name);
+
+		registry
+			.register(Arc::new(NotFromSelf::new(self.name.to_string())))
+			.await;
 
 		let msg = Message {
 			from: self.name.to_string(),
@@ -102,14 +76,6 @@ impl dirigent::traits::Program for TestProgram2 {
 
 			//futures_timer::Delay::new(Duration::from_secs(3)).await;
 		}
-
-		Ok(())
-	}
-
-	fn index(&self) -> Box<dyn Index> {
-		Box::new(NotFromSelf {
-			name: self.name.to_string(),
-		})
 	}
 }
 
@@ -117,7 +83,13 @@ struct NotFromSelf {
 	name: String,
 }
 
-impl dirigent::traits::Index for NotFromSelf {
+impl NotFromSelf {
+	fn new(name: String) -> Self {
+		NotFromSelf { name }
+	}
+}
+
+impl Index for NotFromSelf {
 	fn indexed(&self, t: &Envelope) -> bool {
 		t.try_read_ref::<Message, _, _>(|m| m.from != self.name)
 			.unwrap_or(false)
@@ -125,7 +97,7 @@ impl dirigent::traits::Index for NotFromSelf {
 }
 
 #[test]
-fn test_1() {
+fn it_works() {
 	use tokio::runtime::Runtime;
 
 	let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -135,23 +107,28 @@ fn test_1() {
 
 	// Create the runtime
 	let rt = Runtime::new().unwrap();
-	let mut dirigent = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
+	let (dirigent, takt) = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
 
-	dirigent
-		.schedule(Box::new(TestProgram2 { name: "FOO" }), "FOO")
-		.unwrap();
-	dirigent
-		.schedule(Box::new(TestProgram2 { name: "BAR" }), "BAR")
-		.unwrap();
-
-	let takt = dirigent.takt();
+	let mut takt_clone = takt.clone();
 	rt.spawn(async move {
-		let mut takt = takt;
-
 		futures_timer::Delay::new(Duration::from_secs(1)).await;
-		takt.kill(Pid::new(2)).await;
+		takt_clone
+			.schedule(Box::new(TestProgram { name: "FOO" }), "FOO")
+			.await
+			.unwrap();
 		futures_timer::Delay::new(Duration::from_secs(5)).await;
-		takt.stop(Pid::new(1)).await.unwrap();
+		takt_clone
+			.schedule(Box::new(TestProgram { name: "BAR" }), "BAR")
+			.await
+			.unwrap();
+	});
+
+	let mut takt_clone = takt.clone();
+	rt.spawn(async move {
+		futures_timer::Delay::new(Duration::from_secs(1)).await;
+		takt_clone.kill(Pid::new(2)).await.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(5)).await;
+		takt_clone.stop(Pid::new(1)).await.unwrap();
 	});
 
 	rt.block_on(async move {
@@ -159,30 +136,4 @@ fn test_1() {
 	});
 
 	tracing::info!("Finished main...");
-}
-
-#[test]
-fn test_2() {
-	use tokio::runtime::Runtime;
-
-	// Create the runtime
-	let rt = Runtime::new().unwrap();
-	let mut dirigent = dirigent::Dirigent::<TestProgram2, _>::new(rt);
-
-	dirigent
-		.schedule(TestProgram2 { name: "Test 2" }, "Test 2")
-		.unwrap();
-	let takt = dirigent.takt();
-
-	let rt = Runtime::new().unwrap();
-	rt.spawn(async move {
-		let mut takt = takt;
-		takt.schedule_and_start(TestProgram2 { name: "Test 1" }, "Test 1")
-			.await
-			.unwrap();
-	});
-
-	rt.block_on(async move {
-		dirigent.begin().await.expect("Failed launching dirigent.");
-	});
 }

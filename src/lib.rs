@@ -17,43 +17,58 @@
 
 #![allow(dead_code)]
 
-use std::fmt::Debug;
+use std::{
+	fmt::Debug,
+	sync::{
+		atomic::{AtomicBool, Ordering},
+		Arc,
+	},
+};
 
-use futures::{select, Future, FutureExt};
-use tracing::{trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
-	channel::{mpmc, oneshot::channel},
-	process::{PidAllocation, ProcessPool, Spawnable},
-	traits::{ExitStatus, Program, ScheduleExt, Scheduler, Spawner},
+	channel::{mpmc, mpsc, oneshot::channel},
+	envelope::Envelope,
+	process::{Pid, Process, Spawnable},
+	traits::{ExitStatus, Program, Spawner},
+	updatable::{Updatable, Updater},
 };
 
 pub mod channel;
 pub mod envelope;
+pub mod index;
 mod process;
+pub mod scheduler;
+pub mod shutdown;
 pub mod spawner;
 #[cfg(test)]
 mod tests;
 pub mod traits;
+pub mod updatable;
 
 pub const DEFAULT_SHUTDOWN_TIME_SECS: u64 = 10;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Pid(usize);
-impl Pid {
-	pub fn new(pid: usize) -> Self {
-		Pid(pid)
+#[derive(Debug)]
+struct RawWrapper<P>(*const P);
+
+impl<P: Program> RawWrapper<P> {
+	fn new(p: P) -> Self {
+		RawWrapper(Box::into_raw(Box::new(p)))
 	}
 
-	pub fn id(&self) -> usize {
-		self.0
+	fn recover(self) -> P {
+		unsafe { *Box::from_raw(self.0 as *mut P) }
 	}
 }
+
+unsafe impl<P> Send for RawWrapper<P> {}
+unsafe impl<P> Sync for RawWrapper<P> {}
 
 #[derive(Debug)]
 enum Command<P> {
 	Schedule {
-		program: *const P,
+		program: RawWrapper<P>,
 		name: &'static str,
 		return_pid: channel::mpsc::Sender<Pid>,
 	},
@@ -73,14 +88,21 @@ enum Command<P> {
 //       of leaking an owned valued of `trait Program`.
 unsafe impl<P: Send> Send for Command<P> {}
 
-struct Dirigent<P: Program, Spawner> {
+struct Dirigent<
+	P: Program,
+	Spawner,
+	const BUS_SIZE: usize = 1024,
+	const MAX_MSG_BATCH_SIZE: usize = 128,
+> {
 	spawner: Spawner,
-	takt_to_dirigent_recv: channel::mpsc::Receiver<Command<P>>,
+	takt_to_dirigent_recv: mpsc::Receiver<Command<P>>,
 }
 
-impl<P: Program, S: Spawner> Dirigent<P, S> {
+impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: usize>
+	Dirigent<P, S, BUS_SIZE, MAX_MSG_BATCH_SIZE>
+{
 	pub fn new(spawner: S) -> (Self, Takt<P>) {
-		let (takt_to_dirigent_send, takt_to_dirigent_recv) = channel::mpsc::channel();
+		let (takt_to_dirigent_send, takt_to_dirigent_recv) = mpsc::channel();
 		(
 			Dirigent {
 				spawner,
@@ -97,89 +119,184 @@ impl<P: Program, S: Spawner> Dirigent<P, S> {
 			spawner,
 			takt_to_dirigent_recv,
 		} = self;
-		let pid_allocation = process::PidAllocation::new();
-		let (program_to_bus_send, program_to_bus_recv) = mpmc::channel();
-		let mut process_pool = ProcessPool::new(program_to_bus_recv);
-		let mut scheduled_processes = Vec::<Spawnable<S::Handle, P>>::new();
+		let (program_to_bus_send, program_to_bus_recv) =
+			mpmc::channel_sized::<Envelope, BUS_SIZE>();
+		let shutdown = Arc::new(AtomicBool::new(false));
+		let (processes, updater) = Updatable::new(Vec::<Process<process::SPS<S>>>::new());
+
+		// NOTE: Spawning the control structure. The bus itself lives in this
+		// state-machine
+		spawner.spawn(Self::serve(
+			spawner.handle(),
+			takt_to_dirigent_recv,
+			updater,
+			program_to_bus_send.clone(),
+			shutdown.clone(),
+		));
 
 		loop {
-			// Serve commands first
-			select! {
-				cmd_res = takt_to_dirigent_recv.recv().fuse() => {
-					if let Ok(cmd) = cmd_res {
-						match cmd {
-							Command::Schedule {
-								program,
-								return_pid,
-								name,
-							} => {
-								// TODO: Verify safety assumptions...
+			// TODO: make shutdown a feature that fires once it is shutdown
+			if !shutdown.load(Ordering::SeqCst) {
+				match program_to_bus_recv.recv().await {
+					Ok(envelope) => {
+						let mut batch = Vec::with_capacity(MAX_MSG_BATCH_SIZE);
+						batch.push(envelope);
 
-								// SAFETY:
-								//  - it is impossible to create an instance of `enum Command` outside
-								//    of this repository
-								//  - the `struct Takt` takes an owner value of `P: Program`
-								//      - the owned type is boxed and leaked then
-								//  - `trait Program` is only implemented for `Box<dyn Program + 'a>`
-								//    and not not for any other smart pointer
-								//  - We NEVER clone a command
-								//  - Channels ALWAYS assure a message is only delivered once over a
-								//    channel
-								//
-								//  Hence, it is safe for us to regard the pointer as valid and
-								// dereference it here
-								let program = unsafe { *Box::from_raw(program as *mut P) };
-
-								let pid = pid_allocation.pid();
-								let spawnable = Spawnable::new(pid, name, spawner.handle(), program, program_to_bus_send.clone());
-
-								trace!(
-									"Scheduled program {} [with {:?}]",
-									name,
-									pid,
-								);
-
-								scheduled_processes.push(spawnable);
-								drop_err(return_pid.send(pid).await);
-							}
-							Command::Start(pid) => {
-								if let Some(index) =
-									scheduled_processes.iter().position(|spawnable| spawnable.pid == pid)
-								{
-									let scheduled = scheduled_processes.swap_remove(index);
-									process_pool.add(scheduled);
+						for _ in 1..MAX_MSG_BATCH_SIZE {
+							if let Ok(maybe_envelope) = program_to_bus_recv.try_recv() {
+								if let Some(envelope) = maybe_envelope {
+									batch.push(envelope);
 								} else {
-									warn!(
-										"Could not start program with {:?}. Reason: Not scheduled.",
-										pid
-									)
+									break;
 								}
+							} else {
+								error!("Bus can no longer receive ")
 							}
-							_ => {},
-							}
-				} else {
-					warn!("All Takt instances dropped. Dirigent can no longer receive commands.");
+						}
+
+						let batch = Arc::new(batch);
+						let active = processes.current().clone();
+						active
+							.iter()
+							.for_each(|process| process.consume_all(batch.clone(), |_| {}))
+					}
+					Err(_) => {
+						unreachable!("This stack holds a reference to the sender. Qed.")
+					}
 				}
-			}
-			_ = process_pool.recv().fuse() => {}
+			} else {
+				info!("Dirigent is shutting down. Shutting down bus.");
+				break;
 			}
 		}
+
+		Ok(())
+	}
+
+	async fn serve(
+		spawner: S::Handle,
+		takt_to_dirigent_recv: mpsc::Receiver<Command<P>>,
+		mut updater: Updater<Vec<Process<process::SPS<S>>>>,
+		program_to_bus_send: mpmc::Sender<Envelope>,
+		_shutdown_sig: Arc<AtomicBool>,
+	) -> ExitStatus {
+		let pid_allocation = process::PidAllocation::new();
+		let mut current_processes = Arc::new(Vec::<Process<process::SPS<S>>>::new());
+		let mut next_processes = Vec::<Process<process::SPS<S>>>::new();
+		let mut scheduled_processes =
+			Vec::<Spawnable<<<S as Spawner>::Handle as Spawner>::Handle, P>>::new();
+
+		loop {
+			match takt_to_dirigent_recv.recv().await {
+				Ok(cmd) => {
+					let update_proccesses = match cmd {
+						Command::Schedule {
+							program,
+							return_pid,
+							name,
+						} => {
+							// TODO: Verify safety assumptions...
+
+							// SAFETY:
+							//  - it is impossible to create an instance of `enum Command` outside
+							//    of this repository
+							//  - the `struct Takt` takes an owner value of `P: Program`
+							//      - the owned type is boxed and leaked then
+							//  - `trait Program` is only implemented for `Box<dyn Program + 'a>`
+							//    and not not for any other smart pointer
+							//  - We NEVER clone a command
+							//  - Channels ALWAYS assure a message is only delivered once over a
+							//    channel
+							//
+							//  Hence, it is safe for us to regard the pointer as valid and
+							// dereference it here
+							let program = program.recover();
+
+							let pid = pid_allocation.pid();
+							let spawnable = Spawnable::new(
+								pid,
+								name,
+								spawner.handle(),
+								program,
+								program_to_bus_send.clone(),
+							);
+
+							trace!("Scheduled program {} [with {:?}]", name, pid,);
+
+							scheduled_processes.push(spawnable);
+							if let Err(e) = return_pid.send(pid).await {
+								warn!("Received error: {:?}", e);
+							}
+
+							false
+						}
+						Command::Start(pid) => {
+							if let Some(index) = scheduled_processes
+								.iter()
+								.position(|spawnable| spawnable.pid == pid)
+							{
+								let scheduled = scheduled_processes.swap_remove(index);
+								next_processes.push(scheduled.spawn());
+							} else {
+								warn!(
+									"Could not start program with {:?}. Reason: Not scheduled.",
+									pid
+								)
+							}
+
+							true
+						}
+						_ => false,
+					};
+
+					if update_proccesses {
+						let updated_processes = next_processes
+							.iter()
+							.chain(current_processes.iter())
+							.map(|process| process.clone())
+							.collect();
+						updater.update(updated_processes);
+						current_processes = updater.current();
+						next_processes = Vec::new();
+					}
+				}
+				Err(_) => {
+					info!("All Takt instances dropped. Dirigent can no longer receive commands.");
+					break;
+				}
+			}
+		}
+
+		Ok(())
 	}
 }
 
-#[derive(Clone)]
 pub struct Takt<P: Program> {
-	sender: channel::mpsc::Sender<Command<P>>,
+	sender: mpsc::Sender<Command<P>>,
+}
+
+impl<P: Program> Clone for Takt<P> {
+	fn clone(&self) -> Self {
+		Takt {
+			sender: self.sender.clone(),
+		}
+	}
 }
 
 unsafe impl<P: Program> Send for Takt<P> {}
 unsafe impl<P: Program> Sync for Takt<P> {}
 
 impl<P: Program> Takt<P> {
-	async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+	pub fn downgrade(&self) -> MinorTakt<P> {
+		MinorTakt {
+			sender: self.sender.clone(),
+		}
+	}
+
+	pub async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
 		let (send, recv) = channel::mpsc::channel::<Pid>();
 		let cmd = Command::Schedule {
-			program: Box::into_raw(Box::new(program)),
+			program: RawWrapper::new(program),
 			return_pid: send,
 			name,
 		};
@@ -192,9 +309,86 @@ impl<P: Program> Takt<P> {
 		Ok(pid)
 	}
 
-	async fn schedule_and_start(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
 		let pid = self.schedule(program, name).await?;
 		self.start(pid).await?;
+		Ok(pid)
+	}
+
+	pub async fn start(&mut self, pid: Pid) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::Start(pid)).await.unwrap();
+
+		Ok(())
+	}
+
+	pub async fn stop(&mut self, pid: Pid) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::Stop(pid)).await.unwrap();
+
+		Ok(())
+	}
+
+	pub async fn preempt(&mut self, pid: Pid) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::Preempt(pid)).await.unwrap();
+
+		Ok(())
+	}
+
+	pub async fn kill(&mut self, pid: Pid) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::Kill(pid)).await.unwrap();
+
+		Ok(())
+	}
+
+	pub async fn unpreempt(&mut self, pid: Pid) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::Unpreempt(pid)).await.unwrap();
+
+		Ok(())
+	}
+
+	pub async fn shutdown(&mut self) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::Shutdown).await.unwrap();
+
+		Ok(())
+	}
+
+	pub async fn force_shutdown(&mut self) -> Result<(), ()> {
+		// TODO: Handle
+		self.sender.send(Command::ForceShutdown).await.unwrap();
+
+		Ok(())
+	}
+}
+
+pub struct MinorTakt<P: Program> {
+	sender: mpsc::Sender<Command<P>>,
+}
+
+impl<P: Program> MinorTakt<P> {
+	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+		let pid = self.schedule(program, name).await?;
+		self.start(pid).await?;
+		Ok(pid)
+	}
+
+	async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+		let (send, recv) = channel::mpsc::channel::<Pid>();
+		let cmd = Command::Schedule {
+			program: RawWrapper::new(program),
+			return_pid: send,
+			name,
+		};
+		// TODO: Handle
+		self.sender.send(cmd).await.unwrap();
+
+		// TODO: Handle
+		let pid = recv.recv().await.unwrap();
+
 		Ok(pid)
 	}
 
@@ -203,201 +397,5 @@ impl<P: Program> Takt<P> {
 		self.sender.send(Command::Start(pid)).await.unwrap();
 
 		Ok(())
-	}
-
-	async fn stop(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Stop(pid)).await.unwrap();
-
-		Ok(())
-	}
-
-	async fn preempt(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Preempt(pid)).await.unwrap();
-
-		Ok(())
-	}
-
-	async fn kill(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Kill(pid)).await.unwrap();
-
-		Ok(())
-	}
-
-	async fn unpreempt(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Unpreempt(pid)).await.unwrap();
-
-		Ok(())
-	}
-
-	async fn shutdown(&mut self) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Shutdown).await.unwrap();
-
-		Ok(())
-	}
-
-	async fn force_shutdown(&mut self) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::ForceShutdown).await.unwrap();
-
-		Ok(())
-	}
-
-	async fn end(self) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Shutdown).await.unwrap();
-
-		Ok(())
-	}
-}
-
-pub struct SubSpawner<Spawner> {
-	parent_pid: Pid,
-	parent_name: &'static str,
-	scheduler: Scheduler,
-	spawner: Spawner,
-	pid_allocation: PidAllocation,
-}
-
-impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
-	fn new(
-		parent_pid: Pid,
-		parent_name: &'static str,
-		scheduler: Scheduler,
-		spawner: Spawner,
-		pid_allocation: PidAllocation,
-	) -> Self {
-		SubSpawner {
-			parent_pid,
-			parent_name,
-			scheduler,
-			spawner,
-			pid_allocation,
-		}
-	}
-
-	fn spawn_blocking_named(
-		&self,
-		future: impl Future<Output = ExitStatus> + Send + 'static,
-		name: &'static str,
-		pid: Pid,
-	) {
-		let future = future.schedule(self.scheduler.reference());
-
-		let name = name.clone();
-		let parent_pid = self.parent_pid;
-		let parent_name = self.parent_name;
-
-		let future = async move {
-			let res = future.await;
-
-			match res {
-				Err(e) => {
-					warn!(
-						"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
-						name, pid, parent_name, parent_pid, e
-					)
-				}
-				Ok(inner_res) => {
-					if let Err(e) = inner_res {
-						warn!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
-							name, pid, parent_name, parent_pid, e
-						)
-					} else {
-						trace!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] finished.",
-							name,
-							pid,
-							parent_name,
-							parent_pid,
-						)
-					}
-				}
-			}
-
-			Ok(())
-		};
-
-		self.spawner.spawn_blocking(future)
-	}
-
-	fn spawn_named(
-		&self,
-		future: impl Future<Output = ExitStatus> + Send + 'static,
-		name: &'static str,
-		pid: Pid,
-	) {
-		let future = future.schedule(self.scheduler.reference());
-
-		let name = name.clone();
-		let parent_pid = self.parent_pid;
-		let parent_name = self.parent_name;
-
-		let future = async move {
-			let res = future.await;
-
-			match res {
-				Err(e) => {
-					warn!(
-						"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
-						name, pid, parent_name, parent_pid, e
-					)
-				}
-				Ok(inner_res) => {
-					if let Err(e) = inner_res {
-						warn!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
-							name, pid, parent_name, parent_pid, e
-						)
-					} else {
-						trace!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] finished.",
-							name,
-							pid,
-							parent_name,
-							parent_pid,
-						)
-					}
-				}
-			}
-
-			Ok(())
-		};
-
-		self.spawner.spawn(future)
-	}
-}
-
-impl<S: Spawner> Spawner for SubSpawner<S> {
-	type Handle = SubSpawner<S::Handle>;
-
-	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
-		self.spawn_blocking_named(future, "_sub_blocking", self.pid_allocation.pid())
-	}
-
-	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
-		self.spawn_named(future, "_sub", self.pid_allocation.pid())
-	}
-
-	fn handle(&self) -> Self::Handle {
-		SubSpawner {
-			parent_name: self.parent_name,
-			parent_pid: self.parent_pid,
-			spawner: self.spawner.handle(),
-			scheduler: self.scheduler.clone(),
-			pid_allocation: self.pid_allocation.clone(),
-		}
-	}
-}
-
-fn drop_err<T, E: Debug>(res: Result<T, E>) {
-	match res {
-		Ok(_) => {}
-		Err(e) => warn!("Received error: {:?}", e),
 	}
 }

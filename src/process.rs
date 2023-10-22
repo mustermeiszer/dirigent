@@ -27,12 +27,24 @@ use crate::{
 	channel,
 	channel::{mpmc, mpsc, oneshot, RecvError},
 	envelope::Envelope,
+	index,
+	scheduler::{ScheduleExt, Scheduler},
+	spawner::SubSpawner,
 	traits,
-	traits::{
-		ExitStatus, Index, IndexRegistry, InstanceError, Program, ScheduleExt, Scheduler, Spawner,
-	},
-	Pid, SubSpawner,
+	traits::{ExitStatus, Index, InstanceError, Program, Spawner},
 };
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Pid(usize);
+impl Pid {
+	pub fn new(pid: usize) -> Self {
+		Pid(pid)
+	}
+
+	pub fn id(&self) -> usize {
+		self.0
+	}
+}
 
 #[derive(Clone)]
 pub struct PidAllocation(Arc<AtomicUsize>);
@@ -63,56 +75,9 @@ pub enum BusSignal {
 
 const MAX_RECEIVED: usize = 100;
 
-pub struct ProcessPool<S: Spawner> {
-	program_to_bus_recv: mpmc::Receiver<Envelope>,
-	processes: Vec<Process<SPS<S>>>,
-}
-
-impl<S: Spawner> ProcessPool<S> {
-	pub fn new(program_to_bus_recv: mpmc::Receiver<Envelope>) -> Self {
-		ProcessPool {
-			program_to_bus_recv,
-			processes: Vec::new(),
-		}
-	}
-
-	pub fn add<P: Program>(&mut self, spawnable: Spawnable<S, P>) {
-		self.processes.push(spawnable.spawn());
-	}
-
-	pub async fn recv(&self) {
-		let max_tries = core::cmp::min(MAX_RECEIVED, self.processes.len());
-		let mut received = Vec::with_capacity(max_tries);
-
-		if let Ok(envelope) = self.program_to_bus_recv.recv().await {
-			received.push(envelope);
-
-			for _ in 0..max_tries {
-				if let Ok(maybe_envelope) = self.program_to_bus_recv.try_recv() {
-					if let Some(envelope) = maybe_envelope {
-						received.push(envelope);
-					} else {
-						break;
-					}
-				} else {
-					error!("Bus is broken. Aborting.");
-					panic!()
-				}
-			}
-		} else {
-			error!("Bus is broken. Aborting.");
-			panic!()
-		}
-
-		let received = Arc::new(received);
-
-		self.processes
-			.iter()
-			.for_each(|process| process.consume_all(received.clone(), |_res| {}))
-	}
-}
-
-type SPS<S> = SubSpawner<<<S as Spawner>::Handle as Spawner>::Handle>;
+pub type SPS<S> = SubSpawner<
+	<<<<S as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle,
+>;
 pub struct Spawnable<S, P> {
 	/// The process ID of this process.
 	/// Unique for every process run by an dirigent instance
@@ -189,7 +154,10 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 		});
 
 		let program = Box::new(self.program)
-			.start(Box::new(context), IndexRegistry::new(index_registry_send))
+			.start(
+				Box::new(context),
+				Box::new(index::IndexRegistry::new(index_registry_send)),
+			)
 			.schedule(scheduler_ref);
 
 		self.spawner.spawn(async move {
