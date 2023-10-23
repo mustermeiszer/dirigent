@@ -113,12 +113,12 @@ fn it_works() {
 	rt.spawn(async move {
 		futures_timer::Delay::new(Duration::from_secs(1)).await;
 		takt_clone
-			.schedule(Box::new(TestProgram { name: "FOO" }), "FOO")
+			.run(Box::new(TestProgram { name: "FOO" }), "FOO")
 			.await
 			.unwrap();
 		futures_timer::Delay::new(Duration::from_secs(5)).await;
 		takt_clone
-			.schedule(Box::new(TestProgram { name: "BAR" }), "BAR")
+			.run(Box::new(TestProgram { name: "BAR" }), "BAR")
 			.await
 			.unwrap();
 	});

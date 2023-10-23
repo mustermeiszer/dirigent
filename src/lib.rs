@@ -25,7 +25,7 @@ use std::{
 	},
 };
 
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 
 use crate::{
 	channel::{mpmc, mpsc, oneshot::channel},
@@ -158,7 +158,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 						let active = processes.current().clone();
 						active
 							.iter()
-							.for_each(|process| process.consume_all(batch.clone(), |_| {}))
+							.for_each(|process| process.consume(batch.clone()))
 					}
 					Err(_) => {
 						unreachable!("This stack holds a reference to the sender. Qed.")
@@ -221,7 +221,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 								program_to_bus_send.clone(),
 							);
 
-							trace!("Scheduled program {} [with {:?}]", name, pid,);
+							info!("Scheduled program {} [with {:?}]", name, pid,);
 
 							scheduled_processes.push(spawnable);
 							if let Err(e) = return_pid.send(pid).await {
@@ -235,8 +235,13 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 								.iter()
 								.position(|spawnable| spawnable.pid == pid)
 							{
-								let scheduled = scheduled_processes.swap_remove(index);
-								next_processes.push(scheduled.spawn());
+								let process = scheduled_processes.swap_remove(index).spawn();
+								info!(
+									"Spawned program {} [with {:?}]",
+									process.name(),
+									process.pid()
+								);
+								next_processes.push(process);
 							} else {
 								warn!(
 									"Could not start program with {:?}. Reason: Not scheduled.",

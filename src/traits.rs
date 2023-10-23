@@ -141,16 +141,16 @@ pub trait Spawner: Send + Sync + 'static {
 	/// Spawn the given blocking future.
 	fn spawn_blocking_named(
 		&self,
-		future: impl Future<Output = ExitStatus> + Send + 'static,
 		_name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
 	) {
 		self.spawn_blocking(future)
 	}
 	/// Spawn the given non-blocking future.
 	fn spawn_named(
 		&self,
-		future: impl Future<Output = ExitStatus> + Send + 'static,
 		_name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
 	) {
 		self.spawn(future)
 	}

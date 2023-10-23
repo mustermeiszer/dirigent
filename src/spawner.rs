@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use futures::future::Future;
-use tracing::{trace, warn};
+use tracing::{debug, warn};
 
 use crate::{
 	process::{Pid, PidAllocation},
@@ -68,23 +68,20 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 			match res {
 				Err(e) => {
 					warn!(
-						"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+						"Subprocess \"{}\" [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
 						name, pid, parent_name, parent_pid, e
 					)
 				}
 				Ok(inner_res) => {
 					if let Err(e) = inner_res {
 						warn!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+							"Subprocess \"{}\" [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
 							name, pid, parent_name, parent_pid, e
 						)
 					} else {
-						trace!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] finished.",
-							name,
-							pid,
-							parent_name,
-							parent_pid,
+						debug!(
+							"Subprocess \"{}\" [{:?}, Parent: [{},{:?}]] finished.",
+							name, pid, parent_name, parent_pid,
 						)
 					}
 				}
@@ -114,23 +111,20 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 			match res {
 				Err(e) => {
 					warn!(
-						"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+						"Subprocess \"{}\" [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
 						name, pid, parent_name, parent_pid, e
 					)
 				}
 				Ok(inner_res) => {
 					if let Err(e) = inner_res {
 						warn!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
+							"Subprocess \"{}\" [{:?}, Parent: [{},{:?}]] exited with error: {:?}",
 							name, pid, parent_name, parent_pid, e
 						)
 					} else {
-						trace!(
-							"Subprocess {} [{:?}, Parent: [{},{:?}]] finished.",
-							name,
-							pid,
-							parent_name,
-							parent_pid,
+						debug!(
+							"Subprocess \"{}\" [{:?}, Parent: [{},{:?}]] finished.",
+							name, pid, parent_name, parent_pid,
 						)
 					}
 				}
@@ -156,16 +150,16 @@ impl<S: Spawner> Spawner for SubSpawner<S> {
 
 	fn spawn_blocking_named(
 		&self,
-		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
 	) {
 		self.spawn_blocking_named(future, name, self.pid_allocation.pid())
 	}
 
 	fn spawn_named(
 		&self,
-		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
 	) {
 		self.spawn_named(future, name, self.pid_allocation.pid())
 	}

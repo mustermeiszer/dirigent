@@ -15,7 +15,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{
+	atomic::{AtomicBool, Ordering},
+	Arc,
+};
 
 struct Inner<T> {
 	safe: Arc<T>,
@@ -23,13 +26,13 @@ struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-	fn new(t: T) -> Arc<Arc<Self>> {
+	fn new(t: T) -> Self {
 		let arc = Arc::new(t);
 
-		Arc::new(Arc::new(Inner {
+		Inner {
 			safe: arc.clone(),
 			raw: Arc::into_raw(arc),
-		}))
+		}
 	}
 }
 
@@ -40,86 +43,155 @@ impl<T> Drop for Inner<T> {
 }
 
 pub struct Updater<T> {
-	safe: Arc<Arc<Inner<T>>>,
-	raw: *const Arc<Inner<T>>,
+	raw: *const Inner<T>,
+	dropped: Arc<AtomicBool>,
 }
 
 impl<T> Updater<T> {
-	// TODO: Check safety
 	pub fn update(&mut self, t: T) {
 		let inner = Inner::new(t);
 
-		let _drop = Updater {
-			raw: self.raw,
-			safe: self.safe.clone(),
-		};
-
 		// NOTE ON SAFETY: This operation is safe
-		//                 as this structure always contains a valid
-		//                 'Arc' to the data structure.
 		let mutable_raw = unsafe {
-			let ptr = &mut *(self.raw as *mut Arc<Inner<T>>);
+			let ptr = &mut *(self.raw as *mut Inner<T>);
 			ptr
 		};
 
-		let inner_ref = &(*inner);
-		*mutable_raw = inner_ref.clone();
-
-		self.safe = inner;
+		*mutable_raw = inner;
 	}
 
 	pub fn current(&self) -> Arc<T> {
-		self.safe.safe.clone()
+		let reference = unsafe { &*self.raw };
+
+		reference.safe.clone()
 	}
 }
 
 impl<T> Drop for Updater<T> {
 	fn drop(&mut self) {
-		unsafe { drop(Arc::from_raw(self.raw)) }
+		if self.dropped.load(Ordering::SeqCst) {
+			unsafe { drop(Arc::from_raw(self.raw)) }
+		} else {
+			self.dropped.store(true, Ordering::SeqCst)
+		}
 	}
 }
 
 unsafe impl<P> Send for Updater<P> {}
 unsafe impl<P> Sync for Updater<P> {}
 
-pub struct Updatable<T>(Arc<Arc<Inner<T>>>);
-
-impl<T> Clone for Updatable<T> {
-	fn clone(&self) -> Self {
-		Updatable(self.0.clone())
-	}
+pub struct Updatable<T> {
+	raw: *const Inner<T>,
+	dropped: Arc<AtomicBool>,
 }
 
 impl<T> Updatable<T> {
 	pub fn new(t: T) -> (Self, Updater<T>) {
-		let arc = Arc::new(t);
-
-		let inner = Arc::new(Arc::new(Inner {
-			safe: arc.clone(),
-			raw: Arc::into_raw(arc),
-		}));
-
-		let updatable = Updatable(inner.clone());
-		let updater = Updater {
-			safe: inner.clone(),
-			raw: Arc::into_raw(inner),
+		let drop = Arc::new(AtomicBool::new(false));
+		let raw = Arc::into_raw(Arc::new(Inner::new(t)));
+		let updatable = Updatable {
+			raw,
+			dropped: drop.clone(),
 		};
+		let updater = Updater { raw, dropped: drop };
 
 		(updatable, updater)
 	}
 
 	pub fn current(&self) -> Arc<T> {
-		self.0.safe.clone()
+		let reference = unsafe { &*self.raw };
+
+		reference.safe.clone()
 	}
 }
 
 unsafe impl<P> Send for Updatable<P> {}
 unsafe impl<P> Sync for Updatable<P> {}
 
+impl<T> Drop for Updatable<T> {
+	fn drop(&mut self) {
+		if self.dropped.load(Ordering::SeqCst) {
+			unsafe { drop(Arc::from_raw(self.raw)) }
+		} else {
+			self.dropped.store(true, Ordering::SeqCst)
+		}
+	}
+}
+
 #[cfg(test)]
 mod test {
+	use std::thread;
+
+	use crate::updatable::Updatable;
+
 	#[test]
-	fn dropping_works() {
-		todo!()
+	fn it_works() {
+		let first = vec![1u8, 2u8, 3u8];
+		let second = vec![4u8, 5u8, 6u8];
+
+		let (updatable, mut updater) = Updatable::new(first.clone());
+
+		let first_updatable_ref = updatable.current();
+		let first_updater_ref = updater.current();
+		assert_eq!(first_updatable_ref.as_ref(), &first);
+		assert_eq!(first_updater_ref.as_ref(), &first);
+
+		updater.update(second.clone());
+
+		let second_updatable_ref = updatable.current();
+		let second_updater_ref = updater.current();
+
+		assert_eq!(first_updatable_ref.as_ref(), &first);
+		assert_eq!(first_updater_ref.as_ref(), &first);
+		assert_eq!(second_updatable_ref.as_ref(), &second);
+		assert_eq!(second_updater_ref.as_ref(), &second);
+
+		drop(updater);
+		let second_updater_ref = updatable.current();
+		drop(updatable);
+
+		assert_eq!(first_updatable_ref.as_ref(), &first);
+		assert_eq!(first_updater_ref.as_ref(), &first);
+		assert_eq!(second_updatable_ref.as_ref(), &second);
+		assert_eq!(second_updater_ref.as_ref(), &second);
+	}
+
+	#[test]
+	fn thread_update() {
+		let first = vec![1u8, 2u8, 3u8];
+
+		let (updatable, mut updater) = Updatable::new(first.clone());
+
+		assert_eq!(updatable.current().as_ref(), &first);
+		assert_eq!(updater.current().as_ref(), &first);
+
+		let handle = thread::spawn(move || {
+			let second = vec![4u8, 5u8, 6u8];
+			updater.update(second);
+		});
+
+		handle.join().unwrap();
+
+		let second = vec![4u8, 5u8, 6u8];
+		assert_eq!(updatable.current().as_ref(), &second);
+	}
+
+	#[test]
+	fn thread_read() {
+		let first = vec![1u8, 2u8, 3u8];
+		let second = vec![4u8, 5u8, 6u8];
+
+		let (updatable, mut updater) = Updatable::new(first.clone());
+
+		assert_eq!(updatable.current().as_ref(), &first);
+		assert_eq!(updater.current().as_ref(), &first);
+		updater.update(second);
+
+		let handle = thread::spawn(move || {
+			let second = vec![4u8, 5u8, 6u8];
+			assert_eq!(updatable.current().as_ref(), &second);
+		});
+
+		handle.join().unwrap();
 	}
 }

@@ -140,7 +140,7 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 		let process_ref = process.clone();
 
 		let (index_registry_send, index_registry_recv) = oneshot::channel();
-		sub_spawner.spawn(async move {
+		sub_spawner.spawn_named("IndexRegistration", async move {
 			if let Ok(index) = index_registry_recv.recv().await {
 				process_ref.set_index(index);
 				Ok(())
@@ -160,24 +160,24 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			)
 			.schedule(scheduler_ref);
 
-		self.spawner.spawn(async move {
+		self.spawner.spawn_named(self.name, async move {
 			let res = program.await;
 
 			match res {
 				Err(e) => {
 					warn!(
-						"Process {} [{:?}], exited with error: {:?}",
+						"Process \"{}\" [{:?}], exited with error: {:?}",
 						self.name, self.pid, e
 					)
 				}
 				Ok(inner_res) => {
 					if let Err(e) = inner_res {
 						warn!(
-							"Process {} [{:?}]exited with error: {:?}",
+							"Process \"{}\" [{:?}]exited with error: {:?}",
 							self.name, self.pid, e
 						)
 					} else {
-						trace!("Process {} [{:?}] finished.", self.name, self.pid)
+						trace!("Process \"{}\" [{:?}] finished.", self.name, self.pid)
 					}
 				}
 			}
@@ -190,6 +190,16 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 }
 
 pub struct Process<S>(Arc<InnerProcess<S>>);
+
+impl<S> Process<S> {
+	pub fn name(&self) -> &'static str {
+		self.0.name
+	}
+
+	pub fn pid(&self) -> Pid {
+		self.0.pid
+	}
+}
 
 impl<S> Clone for Process<S> {
 	fn clone(&self) -> Self {
@@ -208,73 +218,35 @@ impl<S: Spawner> Process<S> {
 		self.inner_mut().index = Some(index);
 	}
 
-	pub fn consume<C>(&self, envelope: Envelope, call_back: C)
-	where
-		C: FnOnce(&ExitStatus) + Send + 'static,
-	{
+	pub fn consume(&self, envelopes: Arc<Vec<Envelope>>) {
 		if let Some(ref index) = self.0.index {
 			let process_ref = self.clone();
 			let index = index.clone();
 
-			self.0.spawner.spawn(async move {
-				let res = if index.indexed(&envelope) {
-					process_ref
-						.0
-						.process_to_program_send
-						.send(envelope.clone())
-						.await
-						.map_err(|err| {
-							error!(
-								"Failed sending to program {} [{:?}]. Enveloped missed: {:?}",
-								process_ref.0.name, process_ref.0.pid, envelope
-							);
+			self.0
+				.spawner
+				.spawn_named("EnvelopeConsumption", async move {
+					for envelope in envelopes.iter() {
+						if index.indexed(&envelope) {
+							process_ref
+								.0
+								.process_to_program_send
+								.send(envelope.clone())
+								.await
+								.map_err(|err| {
+									error!(
+										"Failed sending to program {} [{:?}]. Program can no longer receive messages. Killing process...",
+										process_ref.0.name, process_ref.0.pid
+									);
 
-							InstanceError::Internal(Box::new(err))
-						})
-				} else {
+									// Make process state killed
+
+									InstanceError::Internal(Box::new(err))
+								})?
+						}
+					}
 					Ok(())
-				};
-
-				call_back(&res);
-
-				res
-			});
-		}
-	}
-
-	pub fn consume_all<C>(&self, envelopes: Arc<Vec<Envelope>>, call_back: C)
-	where
-		C: Fn(&ExitStatus) + Send + 'static,
-	{
-		if let Some(ref index) = self.0.index {
-			let process_ref = self.clone();
-			let index = index.clone();
-
-			self.0.spawner.spawn(async move {
-				for envelope in envelopes.as_ref() {
-					let res = if index.indexed(&envelope) {
-						process_ref
-							.0
-							.process_to_program_send
-							.send(envelope.clone())
-							.await
-							.map_err(|err| {
-								error!(
-									"Failed sending to program {} [{:?}]. Enveloped missed: {:?}",
-									process_ref.0.name, process_ref.0.pid, envelope
-								);
-
-								InstanceError::Internal(Box::new(err))
-							})
-					} else {
-						Ok(())
-					};
-
-					call_back(&res);
-				}
-
-				Ok(())
-			});
+				});
 		}
 	}
 }
@@ -286,10 +258,10 @@ impl<S: Spawner> Process<S> {
 struct InnerProcess<S> {
 	/// The process ID of this process.
 	/// Unique for every process run by an dirigent instance
-	pid: Pid,
+	pub pid: Pid,
 
 	/// The name of the program this process is controlling
-	name: &'static str,
+	pub name: &'static str,
 
 	/// Signals from the process for the program
 	process_to_program_send: mpsc::Sender<Envelope>,
