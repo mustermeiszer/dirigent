@@ -20,7 +20,6 @@ use crate as dirigent;
 use crate::{
 	envelope::Envelope,
 	traits::{Context, ExitStatus, Index, IndexRegistry, Program},
-	Pid,
 };
 
 #[derive(Clone)]
@@ -56,9 +55,8 @@ impl dirigent::traits::Program for TestProgram {
 			text: format!("Hello From Program {}", self.name),
 		};
 
-		if let Err(e) = ctx.send(msg.into()).await {
-			tracing::error!("{}: Could not send, {:?}", self.name, e)
-		};
+		ctx.send(msg.clone().into()).await.unwrap();
+		ctx.send(msg.into()).await.unwrap();
 
 		loop {
 			match ctx.recv().await {
@@ -107,7 +105,8 @@ fn it_works() {
 
 	// Create the runtime
 	let rt = Runtime::new().unwrap();
-	let (dirigent, takt) = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
+	let (dirigent, takt) =
+		dirigent::Dirigent::<Box<dyn Program>, _, 1024, 1>::new(rt.handle().clone());
 
 	let mut takt_clone = takt.clone();
 	rt.spawn(async move {
@@ -116,7 +115,7 @@ fn it_works() {
 			.run(Box::new(TestProgram { name: "FOO" }), "FOO")
 			.await
 			.unwrap();
-		futures_timer::Delay::new(Duration::from_secs(5)).await;
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
 		takt_clone
 			.run(Box::new(TestProgram { name: "BAR" }), "BAR")
 			.await
@@ -125,10 +124,8 @@ fn it_works() {
 
 	let mut takt_clone = takt.clone();
 	rt.spawn(async move {
-		futures_timer::Delay::new(Duration::from_secs(1)).await;
-		takt_clone.kill(Pid::new(2)).await.unwrap();
 		futures_timer::Delay::new(Duration::from_secs(5)).await;
-		takt_clone.stop(Pid::new(1)).await.unwrap();
+		takt_clone.force_shutdown().await.unwrap();
 	});
 
 	rt.block_on(async move {

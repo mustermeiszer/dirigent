@@ -15,22 +15,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
+use std::{fmt::Debug, sync::Arc};
 
-use std::{
-	fmt::Debug,
-	sync::{
-		atomic::{AtomicBool, Ordering},
-		Arc,
-	},
-};
-
-use tracing::{error, info, warn};
+use futures::{select, FutureExt};
+use tracing::{error, info, trace, warn};
 
 use crate::{
 	channel::{mpmc, mpsc, oneshot::channel},
 	envelope::Envelope,
 	process::{Pid, Process, Spawnable},
+	shutdown::Shutdown,
 	traits::{ExitStatus, Program, Spawner},
 	updatable::{Updatable, Updater},
 };
@@ -121,52 +115,55 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		} = self;
 		let (program_to_bus_send, program_to_bus_recv) =
 			mpmc::channel_sized::<Envelope, BUS_SIZE>();
-		let shutdown = Arc::new(AtomicBool::new(false));
 		let (processes, updater) = Updatable::new(Vec::<Process<process::SPS<S>>>::new());
+		let (mut shutdown, handle) = Shutdown::new();
 
 		// NOTE: Spawning the control structure. The bus itself lives in this
-		// state-machine
+		//       state-machine.
 		spawner.spawn(Self::serve(
 			spawner.handle(),
 			takt_to_dirigent_recv,
 			updater,
 			program_to_bus_send.clone(),
-			shutdown.clone(),
+			handle,
 		));
 
 		loop {
-			// TODO: make shutdown a feature that fires once it is shutdown
-			if !shutdown.load(Ordering::SeqCst) {
-				match program_to_bus_recv.recv().await {
-					Ok(envelope) => {
-						let mut batch = Vec::with_capacity(MAX_MSG_BATCH_SIZE);
-						batch.push(envelope);
+			select! {
+				() = shutdown => {
+					info!("Dirigent is shutting down. Shutting down bus.");
+					break;
+				},
+				res = program_to_bus_recv.recv().fuse() => {
+					trace!("Bus: polling...");
+					match res {
+						Ok(envelope) => {
+							let mut batch = Vec::with_capacity(MAX_MSG_BATCH_SIZE);
+							batch.push(envelope);
 
-						for _ in 1..MAX_MSG_BATCH_SIZE {
-							if let Ok(maybe_envelope) = program_to_bus_recv.try_recv() {
-								if let Some(envelope) = maybe_envelope {
-									batch.push(envelope);
+							for _ in 1..MAX_MSG_BATCH_SIZE {
+								if let Ok(maybe_envelope) = program_to_bus_recv.try_recv() {
+									if let Some(envelope) = maybe_envelope {
+										batch.push(envelope);
+									} else {
+										break;
+									}
 								} else {
-									break;
+									error!("Bus can no longer receive ")
 								}
-							} else {
-								error!("Bus can no longer receive ")
 							}
-						}
 
-						let batch = Arc::new(batch);
-						let active = processes.current().clone();
-						active
-							.iter()
-							.for_each(|process| process.consume(batch.clone()))
-					}
-					Err(_) => {
-						unreachable!("This stack holds a reference to the sender. Qed.")
+							let batch = Arc::new(batch);
+							let active = processes.current().clone();
+							active
+								.iter()
+								.for_each(|process| process.consume(batch.clone()))
+						}
+						Err(_) => {
+							unreachable!("This stack holds a reference to the sender. Qed.")
+						}
 					}
 				}
-			} else {
-				info!("Dirigent is shutting down. Shutting down bus.");
-				break;
 			}
 		}
 
@@ -178,7 +175,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		takt_to_dirigent_recv: mpsc::Receiver<Command<P>>,
 		mut updater: Updater<Vec<Process<process::SPS<S>>>>,
 		program_to_bus_send: mpmc::Sender<Envelope>,
-		_shutdown_sig: Arc<AtomicBool>,
+		shutdown_handle: shutdown::Handle,
 	) -> ExitStatus {
 		let pid_allocation = process::PidAllocation::new();
 		let mut current_processes = Arc::new(Vec::<Process<process::SPS<S>>>::new());
@@ -251,6 +248,11 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 
 							true
 						}
+						Command::ForceShutdown => {
+							info!("ForceShutdown: Dirigent ending control event loop.");
+							shutdown_handle.shutdown();
+							break;
+						}
 						_ => false,
 					};
 
@@ -266,7 +268,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 					}
 				}
 				Err(_) => {
-					info!("All Takt instances dropped. Dirigent can no longer receive commands.");
+					info!("Dirigent can no longer receive commands. All Takt instances dropped...");
 					break;
 				}
 			}

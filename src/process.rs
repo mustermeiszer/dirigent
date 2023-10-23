@@ -58,23 +58,6 @@ impl PidAllocation {
 	}
 }
 
-/// Commands
-pub enum ProcessSignal {
-	Stop,
-	Kill,
-	Preempt,
-	UnPreempt,
-}
-
-pub enum BusSignal {
-	Process(Pid, ProcessSignal),
-	All(ProcessSignal),
-	Message(Envelope),
-	Messages(Arc<Vec<Envelope>>),
-}
-
-const MAX_RECEIVED: usize = 100;
-
 pub type SPS<S> = SubSpawner<
 	<<<<S as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle,
 >;
