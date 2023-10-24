@@ -27,12 +27,12 @@ use std::{
 };
 
 use futures::task::AtomicWaker;
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::{process::Pid, traits::InstanceError};
 
 #[derive(Clone, Copy)]
-pub enum InstanceState {
+pub enum ScheduledState {
 	Preempted,
 	Running,
 	Killed,
@@ -64,7 +64,7 @@ impl Scheduler {
 		}
 	}
 
-	pub fn reference(&self) -> SchedulerRef {
+	pub fn reference(&self) -> ScheduledRef {
 		let inner = Arc::new(Inner {
 			waker: AtomicWaker::new(),
 			state: AtomicUsize::new(RUNNING),
@@ -73,7 +73,7 @@ impl Scheduler {
 
 		self.on_states(|states| states.push(inner.clone()));
 
-		SchedulerRef {
+		ScheduledRef {
 			inner,
 			pid: self.pid.clone(),
 		}
@@ -86,88 +86,149 @@ impl Scheduler {
 		}
 	}
 
-	pub fn waking(&mut self) {
-		trace!("Scheduler: Waking all state-machines of {:?}...", self.pid);
-
-		self.on_states(|states| {
-			for instance in states {
-				instance.waker.wake()
-			}
-		})
-	}
-
-	pub fn kill(&mut self) {
+	pub fn kill(&self) {
 		let mut count = 0usize;
 		self.on_states(|states| {
 			states.retain(|instance| {
 				count += 1;
-				let not_finished = !instance.finished.load(Ordering::Relaxed);
+				let finished = instance.finished.load(Ordering::Relaxed);
 
-				if not_finished {
+				if !finished {
 					trace!(
 						"Scheduler: Waking instance {} of {:?} for killing",
 						count,
 						self.pid
 					);
-
-					instance.state.store(KILLED, Ordering::Relaxed);
-					instance.finished.store(true, Ordering::Relaxed);
-					instance.waker.wake()
 				}
 
-				not_finished
+				match instance
+					.state
+					.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |state| match state {
+						RUNNING => Some(KILLED),
+						PREEMPTED => Some(KILLED),
+						KILLED => {
+							// NOTE: Killing again is fine
+							Some(KILLED)
+						}
+						FINISHED => {
+							warn!("Re-killing a finished process. Process stays finished.");
+							None
+						}
+						_ => unreachable!("All values are covered. qed."),
+					}) {
+					Ok(_) => {
+						instance.finished.store(true, Ordering::SeqCst);
+						instance.waker.wake()
+					}
+					Err(_) => {
+						instance.finished.store(true, Ordering::SeqCst);
+					}
+				}
+
+				!finished
 			});
 		})
 	}
 
-	pub fn preempt(&mut self) {
+	pub fn preempt(&self) {
 		let mut count = 0usize;
 		self.on_states(|states| {
 			states.retain(|instance| {
 				count += 1;
+				let finished = instance.finished.load(Ordering::Relaxed);
 
-				let not_dead = !instance.finished.load(Ordering::SeqCst);
-				if not_dead {
-					instance.state.store(PREEMPTED, Ordering::Relaxed);
-					tracing::debug!("Waking {:?} for Preemption", self.pid);
-					instance.waker.wake()
+				trace!(
+					"Scheduler: Waking instance {} of {:?} for preemption",
+					count,
+					self.pid
+				);
+
+				match instance
+					.state
+					.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |state| match state {
+						RUNNING => Some(PREEMPTED),
+						PREEMPTED => None,
+						KILLED => {
+							warn!("Preempting a killed process. Process stays killed.");
+							Some(KILLED)
+						}
+						FINISHED => {
+							warn!("Preempting a finished process. Process stays finished.");
+							None
+						}
+						_ => unreachable!("All values are covered. qed."),
+					}) {
+					Ok(val) => {
+						instance.finished.store(true, Ordering::SeqCst);
+
+						match val {
+							KILLED => instance.waker.wake(),
+							_ => (),
+						}
+					}
+					Err(_) => {
+						instance.finished.store(true, Ordering::SeqCst);
+					}
 				}
 
-				not_dead
+				!finished
 			});
 		})
 	}
 
-	pub fn schedule(&mut self) {
+	pub fn run(&self) {
 		let mut count = 0usize;
 		self.on_states(|states| {
 			states.retain(|instance| {
 				count += 1;
+				let finished = instance.finished.load(Ordering::Relaxed);
 
-				let not_dead = !instance.finished.load(Ordering::SeqCst);
-				if not_dead {
-					instance.state.store(RUNNING, Ordering::Relaxed);
-					tracing::debug!("Waking {:?} for Running", self.pid);
-					instance.waker.wake()
+				trace!(
+					"Scheduler: Waking instance {} of {:?} for running",
+					count,
+					self.pid
+				);
+
+				match instance
+					.state
+					.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |state| match state {
+						RUNNING => None,
+						PREEMPTED => Some(RUNNING),
+						KILLED => {
+							warn!("Re-running a killed process. Process stays killed.");
+							Some(KILLED)
+						}
+						FINISHED => {
+							warn!("Re-running a finished process. Process stays finished.");
+							None
+						}
+						_ => unreachable!("All values are covered. qed."),
+					}) {
+					Ok(_) => {
+						instance.finished.store(true, Ordering::SeqCst);
+						instance.waker.wake()
+					}
+					Err(_) => {}
 				}
 
-				not_dead
+				!finished
 			});
 		})
 	}
 }
 
-pub struct SchedulerRef {
+pub struct ScheduledRef {
 	inner: Arc<Inner>,
 	pid: Pid,
 }
 
-impl SchedulerRef {
-	fn state(&self) -> InstanceState {
+impl ScheduledRef {
+	fn state(&self) -> ScheduledState {
 		match self.inner.state.load(Ordering::SeqCst) {
-			RUNNING => InstanceState::Running,
-			PREEMPTED => InstanceState::Preempted,
-			KILLED => InstanceState::Killed,
+			RUNNING => ScheduledState::Running,
+			PREEMPTED => ScheduledState::Preempted,
+			KILLED => ScheduledState::Killed,
+			FINISHED => ScheduledState::Finished,
 			_ => unreachable!("All constant values are covered. qed."),
 		}
 	}
@@ -192,14 +253,14 @@ impl SchedulerRef {
 pub struct Scheduled<F: Future> {
 	#[pin]
 	future: F,
-	scheduler: SchedulerRef,
+	scheduler: ScheduledRef,
 }
 
 /// Extends `Future` to allow time-limited futures.
 pub trait ScheduleExt: Future {
 	/// Adds a timeout of `duration` to the given `Future`.
 	/// Returns a new `Future`.
-	fn schedule(self, scheduler: SchedulerRef) -> Scheduled<Self>
+	fn schedule(self, scheduler: ScheduledRef) -> Scheduled<Self>
 	where
 		Self: Sized,
 	{
@@ -224,12 +285,12 @@ where
 		this.scheduler.register_waker(ctx.waker());
 
 		match this.scheduler.state() {
-			InstanceState::Killed => {
+			ScheduledState::Killed => {
 				trace!("Scheduler poll: Killing {:?} .", this.scheduler.pid);
 				this.scheduler.set_finished();
 				Poll::Ready(Err(InstanceError::Killed))
 			}
-			InstanceState::Running => {
+			ScheduledState::Running => {
 				trace!("Scheduler poll: Running{:?} .", this.scheduler.pid);
 
 				if let Poll::Ready(output) = this.future.poll(ctx) {
@@ -239,11 +300,11 @@ where
 					Poll::Pending
 				}
 			}
-			InstanceState::Preempted => {
+			ScheduledState::Preempted => {
 				trace!("Scheduler poll: Preempted {:?} .", this.scheduler.pid);
 				Poll::Pending
 			}
-			InstanceState::Finished => {
+			ScheduledState::Finished => {
 				error!(
 					"Scheduler poll: Polling already finished future of {:?}. This is a bug...",
 					this.scheduler.pid

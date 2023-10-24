@@ -41,8 +41,6 @@ mod tests;
 pub mod traits;
 pub mod updatable;
 
-pub const DEFAULT_SHUTDOWN_TIME_SECS: u64 = 10;
-
 #[derive(Debug)]
 struct RawWrapper<P>(*const P);
 
@@ -58,6 +56,11 @@ impl<P: Program> RawWrapper<P> {
 
 unsafe impl<P> Send for RawWrapper<P> {}
 unsafe impl<P> Sync for RawWrapper<P> {}
+
+#[derive(Debug)]
+pub enum Error {
+	AlreadyShutdown,
+}
 
 #[derive(Debug)]
 enum Command<P> {
@@ -135,7 +138,6 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 					break;
 				},
 				res = program_to_bus_recv.recv().fuse() => {
-					trace!("Bus: polling...");
 					match res {
 						Ok(envelope) => {
 							// NOTE: We optimistically allocate enough memory. Choosing a huge batch
@@ -155,6 +157,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 								}
 							}
 
+							trace!("Bus received batch of: {}", batch.len());
 							let batch = Arc::new(batch);
 							let active = processes.current().clone();
 							active
@@ -253,6 +256,9 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 						Command::ForceShutdown => {
 							info!("ForceShutdown: Dirigent ending control event loop.");
 							shutdown_handle.shutdown();
+
+							current_processes.iter().for_each(|process| process.kill());
+
 							break;
 						}
 						_ => false,
@@ -302,73 +308,89 @@ impl<P: Program> Takt<P> {
 		}
 	}
 
-	pub async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+	pub async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let (send, recv) = oneshot::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: RawWrapper::new(program),
 			return_pid: send,
 			name,
 		};
-		// TODO: Handle
-		self.sender.send(cmd).await.unwrap();
+		self.sender
+			.send(cmd)
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		// TODO: Handle
-		let pid = recv.recv().await.unwrap();
+		let pid = recv.recv().await.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(pid)
 	}
 
-	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let pid = self.schedule(program, name).await?;
 		self.start(pid).await?;
 		Ok(pid)
 	}
 
-	pub async fn start(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Start(pid)).await.unwrap();
+	pub async fn start(&mut self, pid: Pid) -> Result<(), Error> {
+		self.sender
+			.send(Command::Start(pid))
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
 
-	pub async fn stop(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Stop(pid)).await.unwrap();
+	pub async fn stop(&mut self, pid: Pid) -> Result<(), Error> {
+		self.sender
+			.send(Command::Stop(pid))
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
 
-	pub async fn preempt(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Preempt(pid)).await.unwrap();
+	pub async fn preempt(&mut self, pid: Pid) -> Result<(), Error> {
+		self.sender
+			.send(Command::Preempt(pid))
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
 
-	pub async fn kill(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Kill(pid)).await.unwrap();
+	pub async fn kill(&mut self, pid: Pid) -> Result<(), Error> {
+		self.sender
+			.send(Command::Kill(pid))
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
 
-	pub async fn unpreempt(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Unpreempt(pid)).await.unwrap();
+	pub async fn unpreempt(&mut self, pid: Pid) -> Result<(), Error> {
+		self.sender
+			.send(Command::Unpreempt(pid))
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
 
-	pub async fn shutdown(&mut self) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Shutdown).await.unwrap();
+	pub async fn shutdown(&mut self) -> Result<(), Error> {
+		self.sender
+			.send(Command::Shutdown)
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
 
-	pub async fn force_shutdown(&mut self) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::ForceShutdown).await.unwrap();
+	pub async fn force_shutdown(&mut self) -> Result<(), Error> {
+		self.sender
+			.send(Command::ForceShutdown)
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}
@@ -379,31 +401,33 @@ pub struct MinorTakt<P: Program> {
 }
 
 impl<P: Program> MinorTakt<P> {
-	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let pid = self.schedule(program, name).await?;
 		self.start(pid).await?;
 		Ok(pid)
 	}
 
-	async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
+	async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let (send, recv) = oneshot::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: RawWrapper::new(program),
 			return_pid: send,
 			name,
 		};
-		// TODO: Handle
-		self.sender.send(cmd).await.unwrap();
-
-		// TODO: Handle
-		let pid = recv.recv().await.unwrap();
+		self.sender
+			.send(cmd)
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
+		let pid = recv.recv().await.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(pid)
 	}
 
-	async fn start(&mut self, pid: Pid) -> Result<(), ()> {
-		// TODO: Handle
-		self.sender.send(Command::Start(pid)).await.unwrap();
+	async fn start(&mut self, pid: Pid) -> Result<(), Error> {
+		self.sender
+			.send(Command::Start(pid))
+			.await
+			.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(())
 	}

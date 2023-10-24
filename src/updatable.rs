@@ -51,7 +51,9 @@ impl<T> Updater<T> {
 	pub fn update(&mut self, t: T) {
 		let inner = Inner::new(t);
 
-		// NOTE ON SAFETY: This operation is safe
+		// NOTE ON SAFETY: This operation is safe as update takes a mutable reference to
+		//                 self which makes it impossible to have a race of updating the
+		//                 raw pointer.
 		let mutable_raw = unsafe {
 			let ptr = &mut *(self.raw as *mut Inner<T>);
 			ptr

@@ -21,7 +21,7 @@ use std::sync::{
 };
 
 use futures::future::BoxFuture;
-use tracing::error;
+use tracing::{error, trace};
 
 use crate::{
 	channel,
@@ -54,7 +54,7 @@ impl PidAllocation {
 	}
 
 	pub fn pid(&self) -> Pid {
-		Pid(self.0.fetch_add(1, Ordering::SeqCst))
+		Pid(self.0.fetch_add(1, Ordering::Relaxed))
 	}
 }
 
@@ -112,7 +112,6 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			sub_spawner.handle(),
 			self.program_to_bus_send,
 		);
-		let scheduler_ref = scheduler.reference();
 		let process = Process::new(
 			self.pid,
 			self.name,
@@ -178,6 +177,15 @@ impl<S: Spawner> Process<S> {
 		}))
 	}
 
+	// NOTE ON SAFETY: This is safe as the method is a private interface and is ONLY
+	//                 called once during `IndexRegistration`
+	fn set_index(&self, index: Arc<dyn Index>) {
+		let raw = self.0.as_ref() as *const InnerProcess<S> as *mut InnerProcess<S>;
+
+		let inner_mut = unsafe { &mut *raw };
+		inner_mut.index = Some(index);
+	}
+
 	pub fn name(&self) -> &'static str {
 		self.0.name
 	}
@@ -186,14 +194,17 @@ impl<S: Spawner> Process<S> {
 		self.0.pid
 	}
 
-	fn inner_mut(&self) -> &mut InnerProcess<S> {
-		let raw = self.0.as_ref() as *const InnerProcess<S> as *mut InnerProcess<S>;
-
-		unsafe { &mut *raw }
+	pub fn kill(&self) {
+		trace!("Killing {} [{:?}]", self.0.name, self.0.pid);
+		self.0.scheduler.kill()
 	}
 
-	fn set_index(&self, index: Arc<dyn Index>) {
-		self.inner_mut().index = Some(index);
+	pub fn preempt(&self) {
+		trace!("Preempting {} [{:?}]", self.0.name, self.0.pid);
+	}
+
+	pub fn run(&self) {
+		trace!("Running {} [{:?}]", self.0.name, self.0.pid);
 	}
 
 	pub fn consume(&self, envelopes: Arc<Vec<Envelope>>) {

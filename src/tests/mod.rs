@@ -19,7 +19,7 @@ use std::{sync::Arc, time::Duration};
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
-	traits::{Context, ExitStatus, Index, IndexRegistry, Program},
+	traits::{Context, ExitStatus, Index, IndexRegistry, InstanceError, Program},
 };
 
 #[derive(Clone)]
@@ -58,21 +58,21 @@ impl dirigent::traits::Program for TestProgram {
 		ctx.send(msg.clone().into()).await.unwrap();
 		ctx.send(msg.into()).await.unwrap();
 
+		ctx.spawn_sub(Box::pin(async move {
+			loop {
+				futures_timer::Delay::new(Duration::from_millis(500)).await
+			}
+		}));
+
 		loop {
 			match ctx.recv().await {
 				Ok(envelope) => {
-					//if let Some(envelope) = envelope {
 					envelope.try_read_ref::<Message, _, _>(|msg| {
 						tracing::info!("{} received: {}", self.name, msg.text)
 					});
-					//}
 				}
-				Err(_e) => {
-					//tracing::error!("{}: Could not recv, {:?}", self.name, e)
-				}
+				Err(_e) => return Err(InstanceError::Killed),
 			}
-
-			//futures_timer::Delay::new(Duration::from_secs(3)).await;
 		}
 	}
 }
