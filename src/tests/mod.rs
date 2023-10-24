@@ -106,8 +106,7 @@ fn it_works() {
 
 	// Create the runtime
 	let rt = Runtime::new().unwrap();
-	let (dirigent, takt) =
-		dirigent::Dirigent::<Box<dyn Program>, _, 1024, 1>::new(rt.handle().clone());
+	let (dirigent, takt) = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
 
 	let mut takt_clone = takt.clone();
 	rt.spawn(async move {
@@ -117,7 +116,7 @@ fn it_works() {
 			.await
 			.unwrap();
 		futures_timer::Delay::new(Duration::from_secs(2)).await;
-		let pid_2 = takt_clone
+		let _pid_2 = takt_clone
 			.run(Box::new(TestProgram { name: "BAR" }), "BAR")
 			.await
 			.unwrap();

@@ -19,7 +19,7 @@ use futures::future::Future;
 use tracing::{debug, warn};
 
 use crate::{
-	process::{Pid, PidAllocation},
+	process::{Pid, SubPid, SubPidAllocation},
 	scheduler::{ScheduleExt, Scheduler},
 	traits,
 	traits::{ExitStatus, Spawner},
@@ -30,7 +30,7 @@ pub struct SubSpawner<Spawner> {
 	parent_name: &'static str,
 	scheduler: Scheduler,
 	spawner: Spawner,
-	pid_allocation: PidAllocation,
+	pid_allocation: SubPidAllocation,
 }
 
 impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
@@ -39,14 +39,13 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		parent_name: &'static str,
 		scheduler: Scheduler,
 		spawner: Spawner,
-		pid_allocation: PidAllocation,
 	) -> Self {
 		SubSpawner {
 			parent_pid,
 			parent_name,
 			scheduler,
 			spawner,
-			pid_allocation,
+			pid_allocation: SubPidAllocation::new(parent_pid),
 		}
 	}
 
@@ -54,9 +53,9 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		&self,
 		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
-		pid: Pid,
+		pid: SubPid,
 	) {
-		let future = future.schedule(self.scheduler.reference());
+		let future = future.schedule(self.scheduler.reference(pid));
 
 		let name = name.clone();
 		let parent_pid = self.parent_pid;
@@ -97,9 +96,9 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		&self,
 		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
-		pid: Pid,
+		pid: SubPid,
 	) {
-		let future = future.schedule(self.scheduler.reference());
+		let future = future.schedule(self.scheduler.reference(pid));
 
 		let name = name.clone();
 		let parent_pid = self.parent_pid;

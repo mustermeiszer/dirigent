@@ -26,9 +26,12 @@ use std::{
 };
 
 use futures::task::AtomicWaker;
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
-use crate::{process::Pid, traits::InstanceError};
+use crate::{
+	process::{Pid, SubPid},
+	traits::InstanceError,
+};
 
 #[derive(Clone, Copy)]
 pub enum ScheduledState {
@@ -46,13 +49,12 @@ const FINISHED: usize = 0b0100;
 #[derive(Clone)]
 pub struct Scheduler {
 	pid: Pid,
-	instances: Arc<AtomicUsize>,
 	states: Arc<Mutex<Vec<Arc<Inner>>>>,
 }
 
 #[derive(Debug)]
 struct Inner {
-	instance: usize,
+	pid: SubPid,
 	waker: AtomicWaker,
 	state: AtomicUsize,
 	finished: AtomicBool,
@@ -62,14 +64,13 @@ impl Scheduler {
 	pub fn new(pid: Pid) -> Scheduler {
 		Scheduler {
 			states: Arc::new(Mutex::new(Vec::new())),
-			instances: Arc::new(AtomicUsize::new(1)),
 			pid,
 		}
 	}
 
-	pub fn reference(&self) -> ScheduledRef {
+	pub fn reference(&self, sub: SubPid) -> ScheduledRef {
 		let inner = Arc::new(Inner {
-			instance: self.instances.fetch_add(1, Ordering::Relaxed),
+			pid: sub,
 			waker: AtomicWaker::new(),
 			state: AtomicUsize::new(RUNNING),
 			finished: AtomicBool::new(false),
@@ -113,8 +114,8 @@ impl Scheduler {
 
 				if !finished {
 					trace!(
-						"Waking instance {} of {:?} for killing",
-						instance.instance,
+						"Waking instance {:?} of {:?} for killing",
+						instance.pid,
 						self.pid
 					);
 				}
@@ -157,8 +158,8 @@ impl Scheduler {
 
 				if !finished {
 					trace!(
-						"Waking instance {} of {:?} for preemption",
-						instance.instance,
+						"Waking instance {:?} of {:?} for preemption",
+						instance.pid,
 						self.pid
 					);
 				}
@@ -201,8 +202,8 @@ impl Scheduler {
 
 				if !finished {
 					trace!(
-						"Waking instance {} of {:?} for running",
-						instance.instance,
+						"Waking instance {:?} of {:?} for running",
+						instance.pid,
 						self.pid
 					);
 				}
@@ -242,6 +243,7 @@ impl Scheduler {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ScheduledRef {
 	pid: Pid,
 	inner: Arc<Inner>,
@@ -259,7 +261,7 @@ impl ScheduledRef {
 	}
 
 	fn register_waker(&mut self, waker: &futures::task::Waker) {
-		trace!("Registering waker {:?} for {:?}.", waker, self.pid);
+		trace!("Registering waker {:?} for {:?}.", waker, self.inner.pid);
 		self.inner.waker.register(waker);
 	}
 

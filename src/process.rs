@@ -64,6 +64,34 @@ impl PidAllocation {
 	}
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SubPid {
+	parent: Pid,
+	sub: Pid,
+}
+
+#[derive(Clone)]
+pub struct SubPidAllocation {
+	parent_pid: Pid,
+	sub_pid: Arc<AtomicUsize>,
+}
+
+impl SubPidAllocation {
+	pub fn new(parent_pid: Pid) -> SubPidAllocation {
+		SubPidAllocation {
+			parent_pid,
+			sub_pid: Arc::new(AtomicUsize::new(1)),
+		}
+	}
+
+	pub fn pid(&self) -> SubPid {
+		SubPid {
+			parent: self.parent_pid,
+			sub: Pid::new(self.sub_pid.fetch_add(1, Ordering::Relaxed)),
+		}
+	}
+}
+
 pub type SPS<S> = SubSpawner<
 	<<<<S as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle,
 >;
@@ -109,7 +137,6 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			self.name,
 			scheduler.clone(),
 			self.spawner.handle(),
-			PidAllocation::new(),
 		);
 
 		let (context, process_to_program_send) = Context::new(
@@ -311,6 +338,7 @@ struct InnerProcess<S> {
 	spawner: S,
 }
 
+#[allow(dead_code)]
 pub struct Context<Spawner> {
 	pid: Pid,
 	name: &'static str,

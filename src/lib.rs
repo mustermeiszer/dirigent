@@ -67,6 +67,7 @@ pub enum Error {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum Command<P> {
 	Schedule {
 		program: RawWrapper<P>,
