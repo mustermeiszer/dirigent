@@ -105,15 +105,19 @@ pub mod mpsc {
 }
 
 pub mod mpmc {
+	use std::fmt::{Debug, Formatter};
+
+	use crossfire::mpmc::SharedFutureBoth;
+
 	use super::DEFAULT_CHANNEL_SIZE;
 	use crate::channel::{RecvError, SendError};
 
-	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+	pub fn channel<T: Send + Unpin>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
 	}
 
-	pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
-		let (inner_sender, inner_recv) = crossbeam::channel::bounded::<T>(SIZE);
+	pub fn channel_sized<T: Send + Unpin, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+		let (inner_sender, inner_recv) = crossfire::mpmc::bounded_future_both::<T>(SIZE);
 
 		(
 			Sender {
@@ -123,9 +127,14 @@ pub mod mpmc {
 		)
 	}
 
-	#[derive(Debug)]
 	pub struct Sender<T: Send> {
-		inner: crossbeam::channel::Sender<T>,
+		inner: crossfire::mpmc::TxFuture<T, SharedFutureBoth>,
+	}
+
+	impl<T: Send> Debug for Sender<T> {
+		fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+			f.debug_struct("mpmc::Sender").finish()
+		}
 	}
 
 	// NOTE: Custom impl to prevent enforcing
@@ -138,24 +147,29 @@ pub mod mpmc {
 		}
 	}
 
-	impl<T: Send> Sender<T> {
+	impl<T: Send + Unpin> Sender<T> {
 		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
-			self.inner.send(t.into()).map_err(|e| match e {
-				crossbeam::channel::SendError(t) => SendError::Closed(t),
+			self.inner.send(t.into()).await.map_err(|e| match e {
+				crossfire::mpmc::SendError(t) => SendError::Closed(t),
 			})
 		}
 
 		pub fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
-				crossbeam::channel::TrySendError::Full(t) => SendError::Full(t),
-				crossbeam::channel::TrySendError::Disconnected(t) => SendError::Closed(t),
+				crossfire::mpmc::TrySendError::Full(t) => SendError::Full(t),
+				crossfire::mpmc::TrySendError::Disconnected(t) => SendError::Closed(t),
 			})
 		}
 	}
 
-	#[derive(Debug)]
 	pub struct Receiver<T: Send> {
-		inner: crossbeam::channel::Receiver<T>,
+		inner: crossfire::mpmc::RxFuture<T, SharedFutureBoth>,
+	}
+
+	impl<T: Send> Debug for Receiver<T> {
+		fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+			f.debug_struct("mpmc::Receiver").finish()
+		}
 	}
 
 	// NOTE: Custom impl to prevent enforcing
@@ -170,8 +184,8 @@ pub mod mpmc {
 
 	impl<T: Send> Receiver<T> {
 		pub async fn recv(&self) -> Result<T, RecvError> {
-			self.inner.recv().map_err(|e| match e {
-				crossbeam::channel::RecvError => RecvError::Closed,
+			self.inner.recv().await.map_err(|e| match e {
+				crossfire::mpmc::RecvError => RecvError::Closed,
 			})
 		}
 
@@ -179,8 +193,8 @@ pub mod mpmc {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(Some(t)),
 				Err(e) => match e {
-					crossbeam::channel::TryRecvError::Disconnected => Err(RecvError::Closed),
-					crossbeam::channel::TryRecvError::Empty => Ok(None),
+					crossfire::mpmc::TryRecvError::Disconnected => Err(RecvError::Closed),
+					crossfire::mpmc::TryRecvError::Empty => Ok(None),
 				},
 			}
 		}
@@ -188,15 +202,19 @@ pub mod mpmc {
 }
 
 pub mod spmc {
+	use std::fmt::{Debug, Formatter};
+
+	use crossfire::mpmc::SharedFutureBoth;
+
 	use super::DEFAULT_CHANNEL_SIZE;
 	use crate::channel::{RecvError, SendError};
 
-	pub fn channel<T: Send>() -> (Sender<T>, Receiver<T>) {
+	pub fn channel<T: Send + Unpin>() -> (Sender<T>, Receiver<T>) {
 		channel_sized::<T, DEFAULT_CHANNEL_SIZE>()
 	}
 
-	pub fn channel_sized<T: Send, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
-		let (inner_sender, inner_recv) = crossbeam::channel::bounded::<T>(SIZE);
+	pub fn channel_sized<T: Send + Unpin, const SIZE: usize>() -> (Sender<T>, Receiver<T>) {
+		let (inner_sender, inner_recv) = crossfire::mpmc::bounded_future_both::<T>(SIZE);
 
 		(
 			Sender {
@@ -206,29 +224,39 @@ pub mod spmc {
 		)
 	}
 
-	#[derive(Debug)]
 	pub struct Sender<T: Send> {
-		inner: crossbeam::channel::Sender<T>,
+		inner: crossfire::mpmc::TxFuture<T, SharedFutureBoth>,
 	}
 
-	impl<T: Send> Sender<T> {
+	impl<T: Send> Debug for Sender<T> {
+		fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+			f.debug_struct("spmc::Sender").finish()
+		}
+	}
+
+	impl<T: Send + Unpin> Sender<T> {
 		pub async fn send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
-			self.inner.send(t.into()).map_err(|e| match e {
-				crossbeam::channel::SendError(t) => SendError::Closed(t),
+			self.inner.send(t.into()).await.map_err(|e| match e {
+				crossfire::mpmc::SendError(t) => SendError::Closed(t),
 			})
 		}
 
 		pub fn try_send(&self, t: impl Into<T> + Send) -> Result<(), SendError<T>> {
 			self.inner.try_send(t.into()).map_err(|e| match e {
-				crossbeam::channel::TrySendError::Full(t) => SendError::Full(t),
-				crossbeam::channel::TrySendError::Disconnected(t) => SendError::Closed(t),
+				crossfire::mpmc::TrySendError::Full(t) => SendError::Full(t),
+				crossfire::mpmc::TrySendError::Disconnected(t) => SendError::Closed(t),
 			})
 		}
 	}
 
-	#[derive(Debug)]
 	pub struct Receiver<T: Send> {
-		inner: crossbeam::channel::Receiver<T>,
+		inner: crossfire::mpmc::RxFuture<T, SharedFutureBoth>,
+	}
+
+	impl<T: Send> Debug for Receiver<T> {
+		fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+			f.debug_struct("spmc::Receiver").finish()
+		}
 	}
 
 	// NOTE: Custom impl to prevent enforcing
@@ -243,8 +271,8 @@ pub mod spmc {
 
 	impl<T: Send> Receiver<T> {
 		pub async fn recv(&self) -> Result<T, RecvError> {
-			self.inner.recv().map_err(|e| match e {
-				crossbeam::channel::RecvError => RecvError::Closed,
+			self.inner.recv().await.map_err(|e| match e {
+				crossfire::mpmc::RecvError => RecvError::Closed,
 			})
 		}
 
@@ -252,8 +280,8 @@ pub mod spmc {
 			match self.inner.try_recv() {
 				Ok(t) => Ok(Some(t)),
 				Err(e) => match e {
-					crossbeam::channel::TryRecvError::Disconnected => Err(RecvError::Closed),
-					crossbeam::channel::TryRecvError::Empty => Ok(None),
+					crossfire::mpmc::TryRecvError::Disconnected => Err(RecvError::Closed),
+					crossfire::mpmc::TryRecvError::Empty => Ok(None),
 				},
 			}
 		}
