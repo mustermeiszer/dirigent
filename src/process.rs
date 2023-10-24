@@ -158,14 +158,15 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 		sub_spawner.spawn_named("IndexRegistration", async move {
 			if let Ok(index) = index_registry_recv.recv().await {
 				process_ref.set_index(index);
-				Ok(())
+				debug!("[{}, ({:?})] set index.", self.name, self.pid)
 			} else {
-				error!(
-					"Pid: {:?}. Index registry oneshot failed receiving",
-					self.pid
-				);
-				Err(InstanceError::Unexpected)
+				debug!(
+					"[{}, ({:?})] has no index. IndexRegistry dropped",
+					self.name, self.pid
+				)
 			}
+
+			Ok(())
 		});
 
 		self.spawner.spawn_named(self.name, async move {

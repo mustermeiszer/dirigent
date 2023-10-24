@@ -88,7 +88,7 @@ impl Scheduler {
 		match self.states.lock() {
 			Ok(mut guard) => {
 				trace!(
-					"Instances of {:?} before schedule: (number: {}): {:?}",
+					"Subprocesses of {:?} before schedule: (number: {}): {:?}",
 					self.pid,
 					guard.len(),
 					guard
@@ -97,7 +97,7 @@ impl Scheduler {
 				f(guard.as_mut());
 
 				trace!(
-					"Instances of {:?} after schedule: (number: {}): {:?}",
+					"Subprocesses of {:?} after schedule: (number: {}): {:?}",
 					self.pid,
 					guard.len(),
 					guard
