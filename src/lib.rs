@@ -114,7 +114,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 			takt_to_dirigent_recv,
 		} = self;
 		let (program_to_bus_send, program_to_bus_recv) =
-			mpmc::channel_sized::<Envelope, BUS_SIZE>();
+			mpsc::channel_sized::<Envelope, BUS_SIZE>();
 		let (processes, updater) = Updatable::new(Vec::<Process<process::SPS<S>>>::new());
 		let (mut shutdown, handle) = Shutdown::new();
 
@@ -138,6 +138,8 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 					trace!("Bus: polling...");
 					match res {
 						Ok(envelope) => {
+							// NOTE: We optimistically allocate enough memory. Choosing a huge batch
+							//       size might leave a lot of unused memory blocked
 							let mut batch = Vec::with_capacity(MAX_MSG_BATCH_SIZE);
 							batch.push(envelope);
 
@@ -149,7 +151,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 										break;
 									}
 								} else {
-									error!("Bus can no longer receive ")
+									error!("Bus broken. This must be an OS error as this stack holds a reference to the sender.")
 								}
 							}
 
@@ -160,7 +162,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 								.for_each(|process| process.consume(batch.clone()))
 						}
 						Err(_) => {
-							unreachable!("This stack holds a reference to the sender. Qed.")
+							error!("Bus broken. This must be an OS error as this stack holds a reference to the sender.")
 						}
 					}
 				}
@@ -174,7 +176,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		spawner: S::Handle,
 		takt_to_dirigent_recv: mpsc::Receiver<Command<P>>,
 		mut updater: Updater<Vec<Process<process::SPS<S>>>>,
-		program_to_bus_send: mpmc::Sender<Envelope>,
+		program_to_bus_send: mpsc::Sender<Envelope>,
 		shutdown_handle: shutdown::Handle,
 	) -> ExitStatus {
 		let pid_allocation = process::PidAllocation::new();

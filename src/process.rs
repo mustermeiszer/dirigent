@@ -73,7 +73,7 @@ pub struct Spawnable<S, P> {
 
 	program: P,
 
-	program_to_bus_send: mpmc::Sender<Envelope>,
+	program_to_bus_send: mpsc::Sender<Envelope>,
 }
 
 impl<P: Program, S: Spawner> Spawnable<S, P> {
@@ -82,7 +82,7 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 		name: &'static str,
 		spawner: S,
 		program: P,
-		program_to_bus_send: mpmc::Sender<Envelope>,
+		program_to_bus_send: mpsc::Sender<Envelope>,
 	) -> Self
 	where
 		P: Program,
@@ -288,7 +288,7 @@ pub struct Context<Spawner> {
 	name: &'static str,
 	spawner: Spawner,
 	from_process: mpsc::Receiver<Envelope>,
-	to_bus: mpmc::Sender<Envelope>,
+	to_bus: mpsc::Sender<Envelope>,
 }
 
 impl<Handle: Spawner> Context<Handle> {
@@ -296,7 +296,7 @@ impl<Handle: Spawner> Context<Handle> {
 		pid: Pid,
 		name: &'static str,
 		spawner: Handle,
-		program_to_bus_send: mpmc::Sender<Envelope>,
+		program_to_bus_send: mpsc::Sender<Envelope>,
 	) -> (Self, mpsc::Sender<Envelope>) {
 		let (process_to_program_send, process_to_program_recv) = mpsc::channel();
 
@@ -333,7 +333,7 @@ where
 		self.to_bus.try_send(envelope)
 	}
 
-	fn sender(&self) -> mpmc::Sender<Envelope> {
+	fn sender(&self) -> mpsc::Sender<Envelope> {
 		self.to_bus.clone()
 	}
 
