@@ -15,9 +15,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
-use futures::{select, FutureExt};
+use futures::{select_biased, FutureExt};
 use tracing::{error, info, trace, warn};
 
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
 	envelope::Envelope,
 	process::{Pid, Process, Spawnable},
 	shutdown::Shutdown,
-	traits::{ExitStatus, Program, Spawner},
+	traits::{ExitStatus, InstanceError, Program, Spawner},
 	updatable::{Updatable, Updater},
 };
 
@@ -40,6 +40,10 @@ pub mod spawner;
 mod tests;
 pub mod traits;
 pub mod updatable;
+
+/// The default time dirigent allows processes to further make process
+/// before killing them.
+const DEFAULT_SHUTDOWN_TIME: u64 = 5;
 
 #[derive(Debug)]
 struct RawWrapper<P>(*const P);
@@ -132,7 +136,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		));
 
 		loop {
-			select! {
+			select_biased! {
 				() = shutdown => {
 					info!("Dirigent is shutting down. Shutting down bus.");
 					break;
@@ -261,18 +265,95 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 
 							break;
 						}
-						_ => false,
+						Command::Shutdown => {
+							info!(
+								"Shutdown: Dirigent ending control event loop in {} second.",
+								DEFAULT_SHUTDOWN_TIME
+							);
+
+							futures_timer::Delay::new(Duration::from_secs(DEFAULT_SHUTDOWN_TIME))
+								.await;
+							current_processes.iter().for_each(|process| process.kill());
+
+							break;
+						}
+						Command::Stop(pid) => Self::on_process(
+							&current_processes,
+							pid,
+							|p| {
+								p.stop();
+								true
+							},
+							false,
+						),
+						Command::Kill(pid) => Self::on_process(
+							&current_processes,
+							pid,
+							|p| {
+								p.kill();
+								true
+							},
+							false,
+						),
+						Command::Preempt(pid) => Self::on_process(
+							&current_processes,
+							pid,
+							|p| {
+								p.preempt();
+								false
+							},
+							false,
+						),
+						Command::Unpreempt(pid) => Self::on_process(
+							&current_processes,
+							pid,
+							|p| {
+								p.run();
+								false
+							},
+							false,
+						),
+						Command::FetchRunning(sender) => {
+							let running: Vec<Pid> =
+								current_processes.iter().map(|p| p.pid()).collect();
+							spawner.spawn(async move {
+								sender.send(running).await.map_err(|e| {
+									trace!("Could not deliver pids. Receiver dropped.");
+
+									InstanceError::Internal(Box::new(e))
+								})
+							});
+
+							false
+						}
 					};
 
+					trace!(
+						"Current processes (amount: {}): {:?}",
+						current_processes.len(),
+						current_processes
+					);
 					if update_proccesses {
+						trace!(
+							"Lined up processes (amount: {}): {:?}",
+							next_processes.len(),
+							next_processes
+						);
 						let updated_processes = next_processes
 							.iter()
 							.chain(current_processes.iter())
-							.map(|process| process.clone())
+							.filter(|process| process.alive())
+							.map(Clone::clone)
 							.collect();
 						updater.update(updated_processes);
 						current_processes = updater.current();
 						next_processes = Vec::new();
+
+						trace!(
+							"Updated processes (amount: {}): {:?}",
+							current_processes.len(),
+							current_processes
+						);
 					}
 				}
 				Err(_) => {
@@ -283,6 +364,22 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		}
 
 		Ok(())
+	}
+
+	fn on_process<F, R>(processes: &Vec<Process<process::SPS<S>>>, pid: Pid, f: F, default: R) -> R
+	where
+		F: FnOnce(&Process<process::SPS<S>>) -> R,
+	{
+		if let Some(index) = processes.iter().position(|process| process.pid() == pid) {
+			f(processes.get(index).expect("Index is existing. qed."))
+		} else {
+			warn!(
+				"Could not execute action on process {:?}. Reason: Not existing.",
+				pid
+			);
+
+			default
+		}
 	}
 }
 

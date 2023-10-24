@@ -19,6 +19,7 @@ use std::{sync::Arc, time::Duration};
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
+	process::Pid,
 	traits::{Context, ExitStatus, Index, IndexRegistry, InstanceError, Program},
 };
 
@@ -111,24 +112,31 @@ fn it_works() {
 	let mut takt_clone = takt.clone();
 	rt.spawn(async move {
 		futures_timer::Delay::new(Duration::from_secs(1)).await;
-		takt_clone
+		let pid_1 = takt_clone
 			.run(Box::new(TestProgram { name: "FOO" }), "FOO")
 			.await
 			.unwrap();
 		futures_timer::Delay::new(Duration::from_secs(2)).await;
-		takt_clone
+		let pid_2 = takt_clone
 			.run(Box::new(TestProgram { name: "BAR" }), "BAR")
 			.await
 			.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
+		takt_clone.preempt(pid_1).await.unwrap();
+		takt_clone.kill(Pid::new(3)).await.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
+		takt_clone.unpreempt(pid_1).await.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
+		takt_clone.force_shutdown().await.unwrap();
 	});
 
 	let mut takt_clone = takt.clone();
 	rt.spawn(async move {
-		futures_timer::Delay::new(Duration::from_secs(5)).await;
+		futures_timer::Delay::new(Duration::from_secs(10)).await;
 		takt_clone.force_shutdown().await.unwrap();
 	});
 
-	rt.block_on(async move {
+	Runtime::new().unwrap().block_on(async move {
 		dirigent.begin().await.unwrap();
 	});
 

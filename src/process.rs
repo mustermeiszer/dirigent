@@ -15,13 +15,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{
-	atomic::{AtomicUsize, Ordering},
-	Arc,
+use std::{
+	fmt::{Debug, Formatter},
+	sync::{
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+		Arc,
+	},
+	time::Duration,
 };
 
 use futures::future::BoxFuture;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
 use crate::{
 	channel,
@@ -33,6 +37,8 @@ use crate::{
 	traits,
 	traits::{ExitStatus, Index, InstanceError, Program, Spawner},
 };
+
+const DEFAULT_PROCESS_SHUTDOWN_TIME: u64 = 5;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Pid(usize);
@@ -159,6 +165,15 @@ impl<S> Clone for Process<S> {
 	}
 }
 
+impl<S> Debug for Process<S> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Process")
+			.field("pid", &self.0.pid)
+			.field("name", &self.0.name)
+			.finish()
+	}
+}
+
 impl<S: Spawner> Process<S> {
 	pub fn new(
 		pid: Pid,
@@ -172,6 +187,7 @@ impl<S: Spawner> Process<S> {
 			name,
 			spawner,
 			scheduler,
+			alive: AtomicBool::new(true),
 			process_to_program_send,
 			index: None,
 		}))
@@ -194,17 +210,43 @@ impl<S: Spawner> Process<S> {
 		self.0.pid
 	}
 
+	pub fn alive(&self) -> bool {
+		self.0.alive.load(Ordering::Relaxed)
+	}
+
 	pub fn kill(&self) {
 		trace!("Killing {} [{:?}]", self.0.name, self.0.pid);
+		self.0.alive.store(false, Ordering::Relaxed);
 		self.0.scheduler.kill()
+	}
+
+	pub fn stop(&self) {
+		trace!("Stopping {} [{:?}]", self.0.name, self.0.pid);
+		let clone = self.clone();
+		clone.0.alive.store(false, Ordering::Relaxed);
+
+		self.0.spawner.spawn_named("ProcessStopping", async move {
+			debug!(
+				"Stopping: Process is killed in {}.",
+				DEFAULT_PROCESS_SHUTDOWN_TIME
+			);
+			futures_timer::Delay::new(Duration::from_secs(DEFAULT_PROCESS_SHUTDOWN_TIME)).await;
+
+			clone.0.scheduler.kill();
+			Ok(())
+		})
 	}
 
 	pub fn preempt(&self) {
 		trace!("Preempting {} [{:?}]", self.0.name, self.0.pid);
+		self.0.alive.store(false, Ordering::Relaxed);
+		self.0.scheduler.preempt()
 	}
 
 	pub fn run(&self) {
 		trace!("Running {} [{:?}]", self.0.name, self.0.pid);
+		self.0.alive.store(true, Ordering::Relaxed);
+		self.0.scheduler.run()
 	}
 
 	pub fn consume(&self, envelopes: Arc<Vec<Envelope>>) {
@@ -247,10 +289,12 @@ impl<S: Spawner> Process<S> {
 struct InnerProcess<S> {
 	/// The process ID of this process.
 	/// Unique for every process run by an dirigent instance
-	pub pid: Pid,
+	pid: Pid,
 
 	/// The name of the program this process is controlling
-	pub name: &'static str,
+	name: &'static str,
+
+	alive: AtomicBool,
 
 	/// Signals from the process for the program
 	process_to_program_send: mpsc::Sender<Envelope>,

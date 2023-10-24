@@ -32,7 +32,7 @@ pub enum InstanceError {
 	Internal(Box<dyn Error + 'static + Send>),
 	Shutdown,
 	Killed,
-	Timeouted,
+	AlreadyFinished,
 	Unexpected,
 }
 
