@@ -85,7 +85,7 @@ enum Command<P> {
 //       of leaking an owned valued of `trait Program`.
 unsafe impl<P: Send> Send for Command<P> {}
 
-struct Dirigent<
+pub struct Dirigent<
 	P: Program,
 	Spawner,
 	const BUS_SIZE: usize = 1024,
@@ -320,7 +320,6 @@ impl<P: Program> Takt<P> {
 			.await
 			.map_err(|_| Error::AlreadyShutdown)?;
 
-		// TODO: Handle
 		let pid = recv.recv().await.map_err(|_| Error::AlreadyShutdown)?;
 
 		Ok(pid)

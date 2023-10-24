@@ -23,7 +23,6 @@ use std::{
 		Arc, Mutex,
 	},
 	task::Poll,
-	time::Duration,
 };
 
 use futures::task::AtomicWaker;
@@ -280,7 +279,7 @@ where
 	type Output = Result<F::Output, InstanceError>;
 
 	fn poll(self: Pin<&mut Self>, ctx: &mut futures::task::Context) -> Poll<Self::Output> {
-		let mut this = self.project();
+		let this = self.project();
 
 		this.scheduler.register_waker(ctx.waker());
 
