@@ -21,14 +21,14 @@ use std::sync::{
 };
 
 use futures::future::BoxFuture;
-use tracing::{error, trace, warn};
+use tracing::error;
 
 use crate::{
 	channel,
 	channel::{mpsc, oneshot, RecvError},
 	envelope::Envelope,
 	index,
-	scheduler::{ScheduleExt, Scheduler},
+	scheduler::Scheduler,
 	spawner::SubSpawner,
 	traits,
 	traits::{ExitStatus, Index, InstanceError, Program, Spawner},
@@ -136,36 +136,13 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			}
 		});
 
-		let program = Box::new(self.program)
-			.start(
-				Box::new(context),
-				Box::new(index::IndexRegistry::new(index_registry_send)),
-			)
-			.schedule(scheduler_ref);
-
 		self.spawner.spawn_named(self.name, async move {
-			let res = program.await;
-
-			match res {
-				Err(e) => {
-					warn!(
-						"Process \"{}\" [{:?}], exited with error: {:?}",
-						self.name, self.pid, e
-					)
-				}
-				Ok(inner_res) => {
-					if let Err(e) = inner_res {
-						warn!(
-							"Process \"{}\" [{:?}]exited with error: {:?}",
-							self.name, self.pid, e
-						)
-					} else {
-						trace!("Process \"{}\" [{:?}] finished.", self.name, self.pid)
-					}
-				}
-			}
-
-			Ok(())
+			Box::new(self.program)
+				.start(
+					Box::new(context),
+					Box::new(index::IndexRegistry::new(index_registry_send)),
+				)
+				.await
 		});
 
 		process
@@ -174,15 +151,8 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 
 pub struct Process<S>(Arc<InnerProcess<S>>);
 
-impl<S> Process<S> {
-	pub fn name(&self) -> &'static str {
-		self.0.name
-	}
-
-	pub fn pid(&self) -> Pid {
-		self.0.pid
-	}
-}
+unsafe impl<S: Send> Send for Process<S> {}
+unsafe impl<S: Sync> Sync for Process<S> {}
 
 impl<S> Clone for Process<S> {
 	fn clone(&self) -> Self {
@@ -191,6 +161,31 @@ impl<S> Clone for Process<S> {
 }
 
 impl<S: Spawner> Process<S> {
+	pub fn new(
+		pid: Pid,
+		name: &'static str,
+		spawner: S,
+		scheduler: Scheduler,
+		process_to_program_send: mpsc::Sender<Envelope>,
+	) -> Self {
+		Process(Arc::new(InnerProcess {
+			pid,
+			name,
+			spawner,
+			scheduler,
+			process_to_program_send,
+			index: None,
+		}))
+	}
+
+	pub fn name(&self) -> &'static str {
+		self.0.name
+	}
+
+	pub fn pid(&self) -> Pid {
+		self.0.pid
+	}
+
 	fn inner_mut(&self) -> &mut InnerProcess<S> {
 		let raw = self.0.as_ref() as *const InnerProcess<S> as *mut InnerProcess<S>;
 
@@ -259,28 +254,6 @@ struct InnerProcess<S> {
 
 	/// Spawner
 	spawner: S,
-}
-
-unsafe impl<S: Send> Send for Process<S> {}
-unsafe impl<S: Sync> Sync for Process<S> {}
-
-impl<S: Spawner> Process<S> {
-	pub fn new(
-		pid: Pid,
-		name: &'static str,
-		spawner: S,
-		scheduler: Scheduler,
-		process_to_program_send: mpsc::Sender<Envelope>,
-	) -> Self {
-		Process(Arc::new(InnerProcess {
-			pid,
-			name,
-			spawner,
-			scheduler,
-			process_to_program_send,
-			index: None,
-		}))
-	}
 }
 
 pub struct Context<Spawner> {
