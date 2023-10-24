@@ -25,7 +25,7 @@ use tracing::{error, trace, warn};
 
 use crate::{
 	channel,
-	channel::{mpmc, mpsc, oneshot, RecvError},
+	channel::{mpsc, oneshot, RecvError},
 	envelope::Envelope,
 	index,
 	scheduler::{ScheduleExt, Scheduler},

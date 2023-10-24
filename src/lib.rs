@@ -21,7 +21,7 @@ use futures::{select, FutureExt};
 use tracing::{error, info, trace, warn};
 
 use crate::{
-	channel::{mpmc, mpsc, oneshot::channel},
+	channel::{mpsc, oneshot, oneshot::channel},
 	envelope::Envelope,
 	process::{Pid, Process, Spawnable},
 	shutdown::Shutdown,
@@ -64,13 +64,13 @@ enum Command<P> {
 	Schedule {
 		program: RawWrapper<P>,
 		name: &'static str,
-		return_pid: channel::mpsc::Sender<Pid>,
+		return_pid: oneshot::Sender<Pid>,
 	},
 	Start(Pid),
 	Stop(Pid),
 	Unpreempt(Pid),
 	Preempt(Pid),
-	FetchRunning(channel::mpsc::Sender<Vec<Pid>>),
+	FetchRunning(oneshot::Sender<Vec<Pid>>),
 	Kill(Pid),
 	Shutdown,
 	ForceShutdown,
@@ -303,7 +303,7 @@ impl<P: Program> Takt<P> {
 	}
 
 	pub async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
-		let (send, recv) = channel::mpsc::channel::<Pid>();
+		let (send, recv) = oneshot::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: RawWrapper::new(program),
 			return_pid: send,
@@ -386,7 +386,7 @@ impl<P: Program> MinorTakt<P> {
 	}
 
 	async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, ()> {
-		let (send, recv) = channel::mpsc::channel::<Pid>();
+		let (send, recv) = oneshot::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: RawWrapper::new(program),
 			return_pid: send,
