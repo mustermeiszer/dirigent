@@ -5,6 +5,10 @@
 
 use std::{sync::Arc, time::Duration};
 
+use futures::FutureExt;
+use tokio::select;
+use tracing::{debug, info};
+
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -51,17 +55,21 @@ impl Program for TestProgram {
 			.register(Arc::new(NotFromSelf::new(self.name.to_string())))
 			.await;
 
-		let msg = Message {
-			from: self.name.to_string(),
-			text: format!("Hello From Program {}", self.name),
-		};
+		let name = self.name.to_string();
+		let name_clone = name.clone();
 
-		ctx.send(msg.clone().into()).await.unwrap();
-		ctx.send(msg.into()).await.unwrap();
-
+		let sender = ctx.sender();
 		ctx.spawn_sub(Box::pin(async move {
 			loop {
-				futures_timer::Delay::new(Duration::from_millis(500)).await
+				debug!("Sending message from {}", name_clone);
+				let msg = Message {
+					from: name_clone.clone(),
+					text: format!("Hello From Program {}", name_clone.clone()),
+				};
+
+				futures_timer::Delay::new(Duration::from_millis(500)).await;
+				let res = sender.send(Envelope::from(msg)).await;
+				debug!("{:?}", res);
 			}
 		}));
 
@@ -69,10 +77,10 @@ impl Program for TestProgram {
 			match ctx.recv().await {
 				Ok(envelope) => {
 					envelope.try_read_ref::<Message, _, _>(|msg| {
-						tracing::info!("{} received: {}", self.name, msg.text)
+						tracing::info!("{} received: {}", name.clone(), msg.text)
 					});
 				}
-				Err(_e) => return Err(InstanceError::Killed),
+				Err(_e) => {}
 			}
 		}
 	}
@@ -133,6 +141,53 @@ fn it_works() {
 
 	Runtime::new().unwrap().block_on(async move {
 		dirigent.begin().await.unwrap();
+	});
+
+	tracing::info!("Finished main...");
+}
+
+//#[tracing_test::traced_test]
+#[test]
+fn killing_all_when_dirigent_dropped() {
+	use tokio::runtime::Runtime;
+
+	let _ = tracing_subscriber::fmt::try_init();
+
+	// Create the runtime
+	let rt = Runtime::new().unwrap();
+	let (dirigent, takt) = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
+
+	let mut takt_clone = takt.clone();
+	rt.spawn(async move {
+		futures_timer::Delay::new(Duration::from_secs(1)).await;
+		let pid_1 = takt_clone
+			.run(Box::new(TestProgram { name: "FOO" }), "FOO")
+			.await
+			.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
+		let _pid_2 = takt_clone
+			.run(Box::new(TestProgram { name: "BAR" }), "BAR")
+			.await
+			.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
+		takt_clone.preempt(pid_1).await.unwrap();
+		takt_clone.kill(Pid::new(3)).await.unwrap();
+		futures_timer::Delay::new(Duration::from_secs(2)).await;
+		takt_clone.unpreempt(pid_1).await.unwrap();
+	});
+
+	// This should trigger the end of the control loop
+	// drop(takt);
+
+	Runtime::new().unwrap().block_on(async move {
+		let timer = futures_timer::Delay::new(Duration::from_secs(8)).fuse();
+		let _ = select! {
+			() = timer => {
+				info!("Timer run out. Canceling Dirigent...");
+				Ok(())
+			},
+			res = dirigent.begin().fuse() => {res}
+		};
 	});
 
 	tracing::info!("Finished main...");

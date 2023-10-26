@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{error::Error, fmt::Debug, sync::Arc};
+use std::{error::Error, fmt::Debug, ops::Deref, sync::Arc};
 
 use futures::future::{BoxFuture, Future};
 
@@ -200,5 +200,31 @@ impl<S: Spawner> SubSpawner for S {
 
 	fn spawn_sub_named(&self, name: &'static str, future: BoxFuture<'static, ExitStatus>) {
 		<S as Spawner>::spawn_named(self, name, future)
+	}
+}
+
+pub trait ExecuteOnDrop: 'static {
+	fn execute(&mut self);
+}
+
+pub struct Drop<T: ExecuteOnDrop>(T);
+
+impl<T: ExecuteOnDrop> Drop<T> {
+	pub fn new(t: T) -> Self {
+		Drop(t)
+	}
+}
+
+impl<T: ExecuteOnDrop> std::ops::Drop for Drop<T> {
+	fn drop(&mut self) {
+		<T as ExecuteOnDrop>::execute(&mut self.0)
+	}
+}
+
+impl<T: ExecuteOnDrop> Deref for Drop<T> {
+	type Target = T;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
 	}
 }

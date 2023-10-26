@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{fmt::Debug, ops::Deref, sync::Arc, time::Duration};
 
 use futures::{select_biased, FutureExt};
 use tracing::{error, info, trace, warn};
@@ -25,7 +25,7 @@ use crate::{
 	envelope::Envelope,
 	process::{Pid, Process, Spawnable},
 	shutdown::Shutdown,
-	traits::{ExitStatus, InstanceError, Program, Spawner},
+	traits::{Drop, ExitStatus, InstanceError, Program, Spawner},
 	updatable::{Updatable, Updater},
 };
 
@@ -44,6 +44,7 @@ pub mod updatable;
 /// The default time dirigent allows processes to further make process
 /// before killing them.
 const DEFAULT_SHUTDOWN_TIME: u64 = 5;
+const MAX_MSG_BATCH_ALLOCATION: usize = 4;
 
 #[derive(Debug)]
 struct RawWrapper<P>(*const P);
@@ -121,10 +122,15 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 			spawner,
 			takt_to_dirigent_recv,
 		} = self;
+
 		let (program_to_bus_send, program_to_bus_recv) =
 			mpsc::channel_sized::<Envelope, BUS_SIZE>();
 		let (processes, updater) = Updatable::new(Vec::<Process<process::SPS<S>>>::new());
-		let (mut shutdown, handle) = Shutdown::new();
+		let (mut shutdown_ctrl, handle_ctrl) = Shutdown::new();
+		let (mut shutdown_bus, handle_bus) = Shutdown::new();
+
+		let processes = Drop::new(processes);
+		//let _drop_shutdown = Drop::new(handle_ctrl);
 
 		// NOTE: Spawning the control structure. The bus itself lives in this
 		//       state-machine.
@@ -133,12 +139,13 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 			takt_to_dirigent_recv,
 			updater,
 			program_to_bus_send.clone(),
-			handle,
+			handle_bus,
+			shutdown_ctrl,
 		));
 
 		loop {
 			select_biased! {
-				() = shutdown => {
+				() = shutdown_bus => {
 					info!("Dirigent is shutting down. Shutting down bus.");
 					break;
 				},
@@ -147,7 +154,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 						Ok(envelope) => {
 							// NOTE: We optimistically allocate enough memory. Choosing a huge batch
 							//       size might leave a lot of unused memory blocked
-							let mut batch = Vec::with_capacity(MAX_MSG_BATCH_SIZE);
+							let mut batch = Vec::with_capacity(MAX_MSG_BATCH_SIZE.saturating_div(MAX_MSG_BATCH_ALLOCATION));
 							batch.push(envelope);
 
 							for _ in 1..MAX_MSG_BATCH_SIZE {
@@ -185,7 +192,8 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		takt_to_dirigent_recv: mpsc::Receiver<Command<P>>,
 		mut updater: Updater<Vec<Process<process::SPS<S>>>>,
 		program_to_bus_send: mpsc::Sender<Envelope>,
-		shutdown_handle: shutdown::Handle,
+		handle_bus: shutdown::Handle,
+		mut shutdown_ctrl: shutdown::Shutdown,
 	) -> ExitStatus {
 		let pid_allocation = process::PidAllocation::new();
 		let mut current_processes = Arc::new(Vec::<Process<process::SPS<S>>>::new());
@@ -194,172 +202,182 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 			Vec::<Spawnable<<<S as Spawner>::Handle as Spawner>::Handle, P>>::new();
 
 		loop {
-			match takt_to_dirigent_recv.recv().await {
-				Ok(cmd) => {
-					let update_proccesses = match cmd {
-						Command::Schedule {
-							program,
-							return_pid,
-							name,
-						} => {
-							// TODO: Verify safety assumptions...
-
-							// SAFETY:
-							//  - it is impossible to create an instance of `enum Command` outside
-							//    of this repository
-							//  - the `struct Takt` takes an owner value of `P: Program`
-							//      - the owned type is boxed and leaked then
-							//  - `trait Program` is only implemented for `Box<dyn Program + 'a>`
-							//    and not not for any other smart pointer
-							//  - We NEVER clone a command
-							//  - Channels ALWAYS assure a message is only delivered once over a
-							//    channel
-							//
-							//  Hence, it is safe for us to regard the pointer as valid and
-							// dereference it here
-							let program = program.recover();
-
-							let pid = pid_allocation.pid();
-							let spawnable = Spawnable::new(
-								pid,
-								name,
-								spawner.handle(),
-								program,
-								program_to_bus_send.clone(),
-							);
-
-							info!("Scheduled program {} [with {:?}]", name, pid,);
-
-							scheduled_processes.push(spawnable);
-							if let Err(e) = return_pid.send(pid).await {
-								warn!("Received error: {:?}", e);
-							}
-
-							false
-						}
-						Command::Start(pid) => {
-							if let Some(index) = scheduled_processes
-								.iter()
-								.position(|spawnable| spawnable.pid == pid)
-							{
-								let process = scheduled_processes.swap_remove(index).spawn();
-								info!(
-									"Spawned program {} [with {:?}]",
-									process.name(),
-									process.pid()
-								);
-								next_processes.push(process);
-							} else {
-								warn!(
-									"Could not start program with {:?}. Reason: Not scheduled.",
-									pid
-								)
-							}
-
-							true
-						}
-						Command::ForceShutdown => {
-							info!("ForceShutdown: Dirigent ending control event loop.");
-							shutdown_handle.shutdown();
-
-							current_processes.iter().for_each(|process| process.kill());
-
-							break;
-						}
-						Command::Shutdown => {
-							info!(
-								"Shutdown: Dirigent ending control event loop in {} second.",
-								DEFAULT_SHUTDOWN_TIME
-							);
-
-							futures_timer::Delay::new(Duration::from_secs(DEFAULT_SHUTDOWN_TIME))
-								.await;
-							current_processes.iter().for_each(|process| process.kill());
-
-							break;
-						}
-						Command::Stop(pid) => Self::on_process(
-							&current_processes,
-							pid,
-							|p| {
-								p.stop();
-								true
-							},
-							false,
-						),
-						Command::Kill(pid) => Self::on_process(
-							&current_processes,
-							pid,
-							|p| {
-								p.kill();
-								true
-							},
-							false,
-						),
-						Command::Preempt(pid) => Self::on_process(
-							&current_processes,
-							pid,
-							|p| {
-								p.preempt();
-								false
-							},
-							false,
-						),
-						Command::Unpreempt(pid) => Self::on_process(
-							&current_processes,
-							pid,
-							|p| {
-								p.run();
-								false
-							},
-							false,
-						),
-						Command::FetchRunning(sender) => {
-							let running: Vec<Pid> =
-								current_processes.iter().map(|p| p.pid()).collect();
-							spawner.spawn(async move {
-								sender.send(running).await.map_err(|e| {
-									trace!("Could not deliver pids. Receiver dropped.");
-
-									InstanceError::Internal(Box::new(e))
-								})
-							});
-
-							false
-						}
-					};
-
-					trace!(
-						"Current processes (amount: {}): {:?}",
-						current_processes.len(),
-						current_processes
-					);
-					if update_proccesses {
-						trace!(
-							"Lined up processes (amount: {}): {:?}",
-							next_processes.len(),
-							next_processes
-						);
-						let updated_processes = next_processes
-							.iter()
-							.chain(current_processes.iter())
-							.filter(|process| process.alive())
-							.map(Clone::clone)
-							.collect();
-						updater.update(updated_processes);
-						current_processes = updater.current();
-						next_processes = Vec::new();
-
-						trace!(
-							"Updated processes (amount: {}): {:?}",
-							current_processes.len(),
-							current_processes
-						);
-					}
-				}
-				Err(_) => {
-					info!("Dirigent can no longer receive commands. All Takt instances dropped...");
+			select_biased! {
+				() = shutdown_ctrl => {
+					info!("Bus shutting down. Ending control loop and all processes.");
+					current_processes.iter().for_each(|process| process.kill());
+					next_processes.iter().for_each(|process| process.kill());
 					break;
+				}
+				res = takt_to_dirigent_recv.recv().fuse() => {
+					match res {
+						Ok(cmd) => {
+							let update_proccesses = match cmd {
+								Command::Schedule {
+									program,
+									return_pid,
+									name,
+								} => {
+									// TODO: Verify safety assumptions...
+
+									// SAFETY:
+									//  - it is impossible to create an instance of `enum Command` outside
+									//    of this repository
+									//  - the `struct Takt` takes an owner value of `P: Program`
+									//      - the owned type is boxed and leaked then
+									//  - `trait Program` is only implemented for `Box<dyn Program + 'a>`
+									//    and not not for any other smart pointer
+									//  - We NEVER clone a command
+									//  - Channels ALWAYS assure a message is only delivered once over a
+									//    channel
+									//
+									//  Hence, it is safe for us to regard the pointer as valid and
+									// dereference it here
+									let program = program.recover();
+
+									let pid = pid_allocation.pid();
+									let spawnable = Spawnable::new(
+										pid,
+										name,
+										spawner.handle(),
+										program,
+										program_to_bus_send.clone(),
+									);
+
+									info!("Scheduled program {} [with {:?}]", name, pid,);
+
+									scheduled_processes.push(spawnable);
+									if let Err(e) = return_pid.send(pid).await {
+										warn!("Received error: {:?}", e);
+									}
+
+									false
+								}
+								Command::Start(pid) => {
+									if let Some(index) = scheduled_processes
+										.iter()
+										.position(|spawnable| spawnable.pid == pid)
+									{
+										let process = scheduled_processes.swap_remove(index).spawn();
+										info!(
+											"Spawned program {} [with {:?}]",
+											process.name(),
+											process.pid()
+										);
+										next_processes.push(process);
+									} else {
+										warn!(
+											"Could not start program with {:?}. Reason: Not scheduled.",
+											pid
+										)
+									}
+
+									true
+								}
+								Command::ForceShutdown => {
+									info!("ForceShutdown: Dirigent ending control event loop.");
+									handle_bus.shutdown();
+									current_processes.iter().for_each(|process| process.kill());
+
+									break;
+								}
+								Command::Shutdown => {
+									info!(
+										"Shutdown: Dirigent ending control event loop in {} second.",
+										DEFAULT_SHUTDOWN_TIME
+									);
+
+									futures_timer::Delay::new(Duration::from_secs(DEFAULT_SHUTDOWN_TIME))
+										.await;
+									handle_bus.shutdown();
+									current_processes.iter().for_each(|process| process.kill());
+
+									break;
+								}
+								Command::Stop(pid) => Self::on_process(
+									&current_processes,
+									pid,
+									|p| {
+										p.stop();
+										true
+									},
+									false,
+								),
+								Command::Kill(pid) => Self::on_process(
+									&current_processes,
+									pid,
+									|p| {
+										p.kill();
+										true
+									},
+									false,
+								),
+								Command::Preempt(pid) => Self::on_process(
+									&current_processes,
+									pid,
+									|p| {
+										p.preempt();
+										false
+									},
+									false,
+								),
+								Command::Unpreempt(pid) => Self::on_process(
+									&current_processes,
+									pid,
+									|p| {
+										p.run();
+										false
+									},
+									false,
+								),
+								Command::FetchRunning(sender) => {
+									let running: Vec<Pid> =
+										current_processes.iter().map(|p| p.pid()).collect();
+									spawner.spawn(async move {
+										sender.send(running).await.map_err(|e| {
+											trace!("Could not deliver pids. Receiver dropped.");
+
+											InstanceError::Internal(Box::new(e))
+										})
+									});
+
+									false
+								}
+							};
+
+							trace!(
+								"Current processes (amount: {}): {:?}",
+								current_processes.len(),
+								current_processes
+							);
+							if update_proccesses {
+								trace!(
+									"Lined up processes (amount: {}): {:?}",
+									next_processes.len(),
+									next_processes
+								);
+								let updated_processes = next_processes
+									.iter()
+									.chain(current_processes.iter())
+									.filter(|process| process.alive())
+									.map(Clone::clone)
+									.collect();
+								updater.update(updated_processes);
+								current_processes = updater.current();
+								next_processes = Vec::new();
+
+								trace!(
+									"Updated processes (amount: {}): {:?}",
+									current_processes.len(),
+									current_processes
+								);
+							}
+						}
+						Err(_) => {
+							warn!("Dirigent can no longer receive commands. All Takt instances dropped...");
+							break;
+						}
+					}
 				}
 			}
 		}

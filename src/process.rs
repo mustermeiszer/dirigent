@@ -35,7 +35,8 @@ use crate::{
 	scheduler::Scheduler,
 	spawner::SubSpawner,
 	traits,
-	traits::{ExitStatus, Index, InstanceError, Program, Spawner},
+	traits::{ExecuteOnDrop, ExitStatus, Index, InstanceError, Program, Spawner},
+	updatable::Updatable,
 };
 
 const DEFAULT_PROCESS_SHUTDOWN_TIME: u64 = 5;
@@ -351,11 +352,21 @@ struct InnerProcess<S> {
 
 impl<S> Drop for InnerProcess<S> {
 	fn drop(&mut self) {
-		trace!("Dropping process \"{} [{:?}]\".", self.name, self.pid);
+		trace!(
+			"Dropping process \"{} [{:?}]\". Killing all subprocesses...",
+			self.name,
+			self.pid
+		);
 
-		// TODO: Is this really necessary?
-		//       If all references are gone, then is killing again needed?
 		self.scheduler.kill()
+	}
+}
+
+impl<S: Spawner> ExecuteOnDrop for Updatable<Vec<Process<S>>> {
+	fn execute(&mut self) {
+		let current = self.current();
+		trace!("Bus shutting down. Killing: {:?}", current);
+		current.iter().for_each(|p| p.kill());
 	}
 }
 

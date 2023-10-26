@@ -27,6 +27,8 @@ use std::{
 
 use futures::{future::FusedFuture, task::AtomicWaker};
 
+use crate::traits::ExecuteOnDrop;
+
 struct Inner {
 	waker: AtomicWaker,
 	is_shutdown: AtomicBool,
@@ -34,6 +36,13 @@ struct Inner {
 
 pub struct Handle {
 	inner: Arc<Inner>,
+}
+
+impl ExecuteOnDrop for Handle {
+	fn execute(&mut self) {
+		self.inner.is_shutdown.store(true, Ordering::Relaxed);
+		self.inner.waker.wake()
+	}
 }
 
 impl Handle {
