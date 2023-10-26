@@ -83,20 +83,20 @@ impl<'a> Program for Box<dyn Program + 'a> {
 }
 
 #[async_trait::async_trait]
-pub trait Context: Send + 'static {
+pub trait Context: Send + Sync + 'static {
 	fn try_recv(&self) -> Result<Option<Envelope>, RecvError>;
 
-	async fn recv(&mut self) -> Result<Envelope, RecvError>;
+	async fn recv(&self) -> Result<Envelope, RecvError>;
 
-	async fn send(&mut self, envelope: Envelope) -> Result<(), SendError<Envelope>>;
+	async fn send(&self, envelope: Envelope) -> Result<(), SendError<Envelope>>;
 
 	fn try_send(&self, envelope: Envelope) -> Result<(), SendError<Envelope>>;
 
 	fn sender(&self) -> channel::mpsc::Sender<Envelope>;
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>);
+	fn spawn_sub(&self, sub: BoxFuture<'static, ExitStatus>);
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>);
+	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>);
 }
 
 #[async_trait::async_trait]
@@ -105,11 +105,11 @@ impl Context for Box<dyn Context> {
 		(**self).try_recv()
 	}
 
-	async fn recv(&mut self) -> Result<Envelope, RecvError> {
+	async fn recv(&self) -> Result<Envelope, RecvError> {
 		(**self).recv().await
 	}
 
-	async fn send(&mut self, envelope: Envelope) -> Result<(), SendError<Envelope>> {
+	async fn send(&self, envelope: Envelope) -> Result<(), SendError<Envelope>> {
 		(**self).send(envelope).await
 	}
 
@@ -121,11 +121,11 @@ impl Context for Box<dyn Context> {
 		(**self).sender()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+	fn spawn_sub(&self, sub: BoxFuture<'static, ExitStatus>) {
 		(**self).spawn_sub(sub)
 	}
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>) {
 		(**self).spawn_sub_blocking(sub)
 	}
 }

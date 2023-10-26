@@ -37,10 +37,10 @@ struct TestProgram {
 }
 
 #[async_trait::async_trait]
-impl dirigent::traits::Program for TestProgram {
+impl Program for TestProgram {
 	async fn start(
 		self: Box<Self>,
-		mut ctx: Box<dyn Context>,
+		ctx: Box<dyn Context>,
 		registry: Box<dyn IndexRegistry>,
 	) -> ExitStatus {
 		tracing::info!("Hello, World from Test Programm {}!", self.name);

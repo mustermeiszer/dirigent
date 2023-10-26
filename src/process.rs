@@ -378,11 +378,11 @@ where
 		self.from_process.try_recv()
 	}
 
-	async fn recv(&mut self) -> Result<Envelope, RecvError> {
+	async fn recv(&self) -> Result<Envelope, RecvError> {
 		self.from_process.recv().await
 	}
 
-	async fn send(&mut self, envelope: Envelope) -> Result<(), channel::SendError<Envelope>> {
+	async fn send(&self, envelope: Envelope) -> Result<(), channel::SendError<Envelope>> {
 		self.to_bus.send(envelope).await
 	}
 
@@ -394,11 +394,11 @@ where
 		self.to_bus.clone()
 	}
 
-	fn spawn_sub(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+	fn spawn_sub(&self, sub: BoxFuture<'static, ExitStatus>) {
 		self.spawner.spawn(sub)
 	}
 
-	fn spawn_sub_blocking(&mut self, sub: BoxFuture<'static, ExitStatus>) {
+	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>) {
 		self.spawner.spawn_blocking(sub)
 	}
 }
