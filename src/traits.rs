@@ -97,6 +97,8 @@ pub trait Context: Send + Sync + 'static {
 	fn spawn_sub(&self, sub: BoxFuture<'static, ExitStatus>);
 
 	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>);
+
+	fn sub_spawner(&self) -> Box<dyn SubSpawner>;
 }
 
 #[async_trait::async_trait]
@@ -128,6 +130,10 @@ impl Context for Box<dyn Context> {
 	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>) {
 		(**self).spawn_sub_blocking(sub)
 	}
+
+	fn sub_spawner(&self) -> Box<dyn SubSpawner> {
+		(**self).sub_spawner()
+	}
 }
 
 pub trait Spawner: Send + Sync + 'static {
@@ -157,4 +163,42 @@ pub trait Spawner: Send + Sync + 'static {
 
 	/// Get a handle to this spawner, allowing to spawn stuff again.
 	fn handle(&self) -> Self::Handle;
+}
+
+pub trait SubSpawner: Send + 'static {
+	/// Spawn the given blocking future.
+	fn spawn_sub_blocking(&self, future: BoxFuture<'static, ExitStatus>);
+	/// Spawn the given non-blocking future.
+	fn spawn_sub(&self, future: BoxFuture<'static, ExitStatus>);
+
+	/// Spawn the given blocking future.
+	fn spawn_sub_blocking_named(
+		&self,
+		_name: &'static str,
+		future: BoxFuture<'static, ExitStatus>,
+	) {
+		self.spawn_sub_blocking(future)
+	}
+	/// Spawn the given non-blocking future.
+	fn spawn_sub_named(&self, _name: &'static str, future: BoxFuture<'static, ExitStatus>) {
+		self.spawn_sub(future)
+	}
+}
+
+impl<S: Spawner> SubSpawner for S {
+	fn spawn_sub_blocking(&self, future: BoxFuture<'static, ExitStatus>) {
+		<S as Spawner>::spawn_blocking(self, future)
+	}
+
+	fn spawn_sub(&self, future: BoxFuture<'static, ExitStatus>) {
+		<S as Spawner>::spawn(self, future)
+	}
+
+	fn spawn_sub_blocking_named(&self, name: &'static str, future: BoxFuture<'static, ExitStatus>) {
+		<S as Spawner>::spawn_blocking_named(self, name, future)
+	}
+
+	fn spawn_sub_named(&self, name: &'static str, future: BoxFuture<'static, ExitStatus>) {
+		<S as Spawner>::spawn_named(self, name, future)
+	}
 }

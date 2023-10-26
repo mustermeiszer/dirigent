@@ -169,7 +169,7 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			Ok(())
 		});
 
-		self.spawner.spawn_named(self.name, async move {
+		sub_spawner.spawn_named(self.name, async move {
 			Box::new(self.program)
 				.start(
 					Box::new(context),
@@ -243,13 +243,13 @@ impl<S: Spawner> Process<S> {
 	}
 
 	pub fn kill(&self) {
-		trace!("Killing {} [{:?}]", self.0.name, self.0.pid);
+		debug!("Killing {} [{:?}]", self.0.name, self.0.pid);
 		self.0.alive.store(false, Ordering::Relaxed);
 		self.0.scheduler.kill()
 	}
 
 	pub fn stop(&self) {
-		trace!("Stopping {} [{:?}]", self.0.name, self.0.pid);
+		debug!("Stopping {} [{:?}]", self.0.name, self.0.pid);
 		let clone = self.clone();
 		clone.0.alive.store(false, Ordering::Relaxed);
 
@@ -266,18 +266,25 @@ impl<S: Spawner> Process<S> {
 	}
 
 	pub fn preempt(&self) {
-		trace!("Preempting {} [{:?}]", self.0.name, self.0.pid);
+		debug!("Preempting {} [{:?}]", self.0.name, self.0.pid);
 		self.0.alive.store(false, Ordering::Relaxed);
 		self.0.scheduler.preempt()
 	}
 
 	pub fn run(&self) {
-		trace!("Running {} [{:?}]", self.0.name, self.0.pid);
+		debug!("Running {} [{:?}]", self.0.name, self.0.pid);
 		self.0.alive.store(true, Ordering::Relaxed);
 		self.0.scheduler.run()
 	}
 
 	pub fn consume(&self, envelopes: Arc<Vec<Envelope>>) {
+		debug!(
+			"Process \"{} [{:?}]\" consuming {:?}",
+			self.name(),
+			self.pid(),
+			envelopes
+		);
+
 		if let Some(ref index) = self.0.index {
 			let process_ref = self.clone();
 			let index = index.clone();
@@ -298,7 +305,10 @@ impl<S: Spawner> Process<S> {
 										process_ref.0.name, process_ref.0.pid
 									);
 
-									// Make process state killed
+									// NOTE: The async `send()` method is never failing on
+									//       `SendError::Full`. Hence, we can assume the channel is
+									// closed       and the process needs to be killed
+									process_ref.kill();
 
 									InstanceError::Internal(Box::new(err))
 								})?
@@ -339,20 +349,30 @@ struct InnerProcess<S> {
 	spawner: S,
 }
 
+impl<S> Drop for InnerProcess<S> {
+	fn drop(&mut self) {
+		trace!("Dropping process \"{} [{:?}]\".", self.name, self.pid);
+
+		// TODO: Is this really necessary?
+		//       If all references are gone, then is killing again needed?
+		self.scheduler.kill()
+	}
+}
+
 #[allow(dead_code)]
-pub struct Context<Spawner> {
+pub struct Context<S> {
 	pid: Pid,
 	name: &'static str,
-	spawner: Spawner,
+	spawner: S,
 	from_process: mpsc::Receiver<Envelope>,
 	to_bus: mpsc::Sender<Envelope>,
 }
 
-impl<Handle: Spawner> Context<Handle> {
+impl<S: Spawner> Context<S> {
 	pub fn new(
 		pid: Pid,
 		name: &'static str,
-		spawner: Handle,
+		spawner: S,
 		program_to_bus_send: mpsc::Sender<Envelope>,
 	) -> (Self, mpsc::Sender<Envelope>) {
 		let (process_to_program_send, process_to_program_recv) = mpsc::channel();
@@ -400,5 +420,9 @@ where
 
 	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>) {
 		self.spawner.spawn_blocking(sub)
+	}
+
+	fn sub_spawner(&self) -> Box<dyn traits::SubSpawner> {
+		Box::new(self.spawner.handle())
 	}
 }
