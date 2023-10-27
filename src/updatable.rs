@@ -29,23 +29,13 @@ const DROPPED: usize = 0b010;
 
 struct Inner<T> {
 	safe: Arc<T>,
-	raw: *const T,
 }
 
 impl<T> Inner<T> {
 	fn new(t: T) -> Self {
 		let arc = Arc::new(t);
 
-		Inner {
-			safe: arc.clone(),
-			raw: Arc::into_raw(arc),
-		}
-	}
-}
-
-impl<T> Drop for Inner<T> {
-	fn drop(&mut self) {
-		unsafe { drop(Arc::from_raw(self.raw)) }
+		Inner { safe: arc.clone() }
 	}
 }
 
