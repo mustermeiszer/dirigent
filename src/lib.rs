@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, ops::Deref, sync::Arc, time::Duration};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use futures::{select_biased, FutureExt};
 use tracing::{error, info, trace, warn};
@@ -25,7 +25,7 @@ use crate::{
 	envelope::Envelope,
 	process::{Pid, Process, Spawnable},
 	shutdown::Shutdown,
-	traits::{Drop, ExitStatus, InstanceError, Program, Spawner},
+	traits::{ExitStatus, InstanceError, OnDrop, Program, Spawner},
 	updatable::{Updatable, Updater},
 };
 
@@ -126,11 +126,11 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		let (program_to_bus_send, program_to_bus_recv) =
 			mpsc::channel_sized::<Envelope, BUS_SIZE>();
 		let (processes, updater) = Updatable::new(Vec::<Process<process::SPS<S>>>::new());
-		let (mut shutdown_ctrl, handle_ctrl) = Shutdown::new();
+		let (shutdown_ctrl, handle_ctrl) = Shutdown::new();
 		let (mut shutdown_bus, handle_bus) = Shutdown::new();
 
-		let processes = Drop::new(processes);
-		//let _drop_shutdown = Drop::new(handle_ctrl);
+		let processes = OnDrop::new(processes);
+		let _drop_shutdown = OnDrop::new(handle_ctrl);
 
 		// NOTE: Spawning the control structure. The bus itself lives in this
 		//       state-machine.
@@ -218,8 +218,6 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 									return_pid,
 									name,
 								} => {
-									// TODO: Verify safety assumptions...
-
 									// SAFETY:
 									//  - it is impossible to create an instance of `enum Command` outside
 									//    of this repository
@@ -415,7 +413,6 @@ impl<P: Program> Clone for Takt<P> {
 }
 
 unsafe impl<P: Program> Send for Takt<P> {}
-unsafe impl<P: Program> Sync for Takt<P> {}
 
 impl<P: Program> Takt<P> {
 	pub fn downgrade(&self) -> MinorTakt<P> {
@@ -424,7 +421,7 @@ impl<P: Program> Takt<P> {
 		}
 	}
 
-	pub async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
+	pub async fn schedule(&self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let (send, recv) = oneshot::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: RawWrapper::new(program),
@@ -441,13 +438,13 @@ impl<P: Program> Takt<P> {
 		Ok(pid)
 	}
 
-	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
+	pub async fn run(&self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let pid = self.schedule(program, name).await?;
 		self.start(pid).await?;
 		Ok(pid)
 	}
 
-	pub async fn start(&mut self, pid: Pid) -> Result<(), Error> {
+	pub async fn start(&self, pid: Pid) -> Result<(), Error> {
 		self.sender
 			.send(Command::Start(pid))
 			.await
@@ -456,7 +453,7 @@ impl<P: Program> Takt<P> {
 		Ok(())
 	}
 
-	pub async fn stop(&mut self, pid: Pid) -> Result<(), Error> {
+	pub async fn stop(&self, pid: Pid) -> Result<(), Error> {
 		self.sender
 			.send(Command::Stop(pid))
 			.await
@@ -465,7 +462,7 @@ impl<P: Program> Takt<P> {
 		Ok(())
 	}
 
-	pub async fn preempt(&mut self, pid: Pid) -> Result<(), Error> {
+	pub async fn preempt(&self, pid: Pid) -> Result<(), Error> {
 		self.sender
 			.send(Command::Preempt(pid))
 			.await
@@ -474,7 +471,7 @@ impl<P: Program> Takt<P> {
 		Ok(())
 	}
 
-	pub async fn kill(&mut self, pid: Pid) -> Result<(), Error> {
+	pub async fn kill(&self, pid: Pid) -> Result<(), Error> {
 		self.sender
 			.send(Command::Kill(pid))
 			.await
@@ -483,7 +480,7 @@ impl<P: Program> Takt<P> {
 		Ok(())
 	}
 
-	pub async fn unpreempt(&mut self, pid: Pid) -> Result<(), Error> {
+	pub async fn unpreempt(&self, pid: Pid) -> Result<(), Error> {
 		self.sender
 			.send(Command::Unpreempt(pid))
 			.await
@@ -492,7 +489,7 @@ impl<P: Program> Takt<P> {
 		Ok(())
 	}
 
-	pub async fn shutdown(&mut self) -> Result<(), Error> {
+	pub async fn shutdown(&self) -> Result<(), Error> {
 		self.sender
 			.send(Command::Shutdown)
 			.await
@@ -501,7 +498,7 @@ impl<P: Program> Takt<P> {
 		Ok(())
 	}
 
-	pub async fn force_shutdown(&mut self) -> Result<(), Error> {
+	pub async fn force_shutdown(&self) -> Result<(), Error> {
 		self.sender
 			.send(Command::ForceShutdown)
 			.await
@@ -515,14 +512,16 @@ pub struct MinorTakt<P: Program> {
 	sender: mpsc::Sender<Command<P>>,
 }
 
+unsafe impl<P: Program> Send for MinorTakt<P> {}
+
 impl<P: Program> MinorTakt<P> {
-	pub async fn run(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
+	pub async fn run(&self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let pid = self.schedule(program, name).await?;
 		self.start(pid).await?;
 		Ok(pid)
 	}
 
-	async fn schedule(&mut self, program: P, name: &'static str) -> Result<Pid, Error> {
+	async fn schedule(&self, program: P, name: &'static str) -> Result<Pid, Error> {
 		let (send, recv) = oneshot::channel::<Pid>();
 		let cmd = Command::Schedule {
 			program: RawWrapper::new(program),
@@ -538,7 +537,7 @@ impl<P: Program> MinorTakt<P> {
 		Ok(pid)
 	}
 
-	async fn start(&mut self, pid: Pid) -> Result<(), Error> {
+	async fn start(&self, pid: Pid) -> Result<(), Error> {
 		self.sender
 			.send(Command::Start(pid))
 			.await

@@ -16,11 +16,9 @@
 // limitations under the License.
 
 use std::sync::{
-	atomic::{AtomicBool, AtomicUsize, Ordering},
+	atomic::{AtomicUsize, Ordering},
 	Arc,
 };
-
-use tracing::trace;
 
 // Idle state
 const LIVE: usize = 0;

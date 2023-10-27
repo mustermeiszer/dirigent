@@ -207,21 +207,21 @@ pub trait ExecuteOnDrop: 'static {
 	fn execute(&mut self);
 }
 
-pub struct Drop<T: ExecuteOnDrop>(T);
+pub struct OnDrop<T: ExecuteOnDrop>(T);
 
-impl<T: ExecuteOnDrop> Drop<T> {
+impl<T: ExecuteOnDrop> OnDrop<T> {
 	pub fn new(t: T) -> Self {
-		Drop(t)
+		OnDrop(t)
 	}
 }
 
-impl<T: ExecuteOnDrop> std::ops::Drop for Drop<T> {
+impl<T: ExecuteOnDrop> std::ops::Drop for OnDrop<T> {
 	fn drop(&mut self) {
 		<T as ExecuteOnDrop>::execute(&mut self.0)
 	}
 }
 
-impl<T: ExecuteOnDrop> Deref for Drop<T> {
+impl<T: ExecuteOnDrop> Deref for OnDrop<T> {
 	type Target = T;
 
 	fn deref(&self) -> &Self::Target {
