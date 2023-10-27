@@ -28,10 +28,7 @@ use std::{
 use futures::task::AtomicWaker;
 use tracing::{trace, warn};
 
-use crate::{
-	process::{Pid, SubPid},
-	traits::InstanceError,
-};
+use crate::{process::Pid, traits::InstanceError};
 
 #[derive(Clone, Copy)]
 pub enum ScheduledState {
@@ -54,7 +51,7 @@ pub struct Scheduler {
 
 #[derive(Debug)]
 struct Inner {
-	pid: SubPid,
+	pid: Pid,
 	waker: AtomicWaker,
 	state: AtomicUsize,
 	finished: AtomicBool,
@@ -68,9 +65,9 @@ impl Scheduler {
 		}
 	}
 
-	pub fn reference(&self, sub: SubPid) -> ScheduledRef {
+	pub fn reference(&self, pid: Pid) -> ScheduledRef {
 		let inner = Arc::new(Inner {
-			pid: sub,
+			pid,
 			waker: AtomicWaker::new(),
 			state: AtomicUsize::new(RUNNING),
 			finished: AtomicBool::new(false),

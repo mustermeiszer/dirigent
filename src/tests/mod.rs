@@ -23,8 +23,8 @@ use tracing::{debug, info};
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
-	process::Pid,
 	traits::{Context, ExitStatus, Index, IndexRegistry, InstanceError, Program},
+	Pid,
 };
 
 #[derive(Clone)]

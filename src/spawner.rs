@@ -19,7 +19,7 @@ use futures::future::Future;
 use tracing::{debug, warn};
 
 use crate::{
-	process::{Pid, SubPid, SubPidAllocation},
+	process::{Pid, SubPidAllocation},
 	scheduler::{ScheduleExt, Scheduler},
 	traits,
 	traits::{ExitStatus, Spawner},
@@ -53,7 +53,7 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		&self,
 		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
-		pid: SubPid,
+		pid: Pid,
 	) {
 		let future = future.schedule(self.scheduler.reference(pid));
 
@@ -96,7 +96,7 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 		&self,
 		future: impl Future<Output = ExitStatus> + Send + 'static,
 		name: &'static str,
-		pid: SubPid,
+		pid: Pid,
 	) {
 		let future = future.schedule(self.scheduler.reference(pid));
 

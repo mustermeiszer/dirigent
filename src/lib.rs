@@ -23,7 +23,7 @@ use tracing::{error, info, trace, warn};
 use crate::{
 	channel::{mpsc, oneshot, oneshot::channel},
 	envelope::Envelope,
-	process::{Pid, Process, Spawnable},
+	process::{Process, Spawnable},
 	shutdown::Shutdown,
 	traits::{ExitStatus, InstanceError, OnDrop, Program, Spawner},
 	updatable::{Updatable, Updater},
@@ -65,6 +65,15 @@ unsafe impl<P> Sync for RawWrapper<P> {}
 #[derive(Debug)]
 pub enum Error {
 	AlreadyShutdown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Pid(usize);
+
+impl Pid {
+	pub fn new(pid: usize) -> Self {
+		Pid(pid)
+	}
 }
 
 #[derive(Debug)]
@@ -245,7 +254,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 									info!("Scheduled program {} [with {:?}]", name, pid,);
 
 									scheduled_processes.push(spawnable);
-									if let Err(e) = return_pid.send(pid).await {
+									if let Err(e) = return_pid.send(Pid::new(pid.of_parent())).await {
 										warn!("Received error: {:?}", e);
 									}
 
@@ -254,7 +263,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 								Command::Start(pid) => {
 									if let Some(index) = scheduled_processes
 										.iter()
-										.position(|spawnable| spawnable.pid == pid)
+										.position(|spawnable| spawnable.pid == pid.into())
 									{
 										let process = scheduled_processes.swap_remove(index).spawn();
 										info!(
@@ -330,7 +339,7 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 								),
 								Command::FetchRunning(sender) => {
 									let running: Vec<Pid> =
-										current_processes.iter().map(|p| p.pid()).collect();
+										current_processes.iter().map(|p| p.pid().of_parent()).map(Pid::new).collect();
 									spawner.spawn(async move {
 										sender.send(running).await.map_err(|e| {
 											trace!("Could not deliver pids. Receiver dropped.");
@@ -387,7 +396,10 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 	where
 		F: FnOnce(&Process<process::SPS<S>>) -> R,
 	{
-		if let Some(index) = processes.iter().position(|process| process.pid() == pid) {
+		if let Some(index) = processes
+			.iter()
+			.position(|process| process.pid() == pid.into())
+		{
 			f(processes.get(index).expect("Index is existing. qed."))
 		} else {
 			warn!(

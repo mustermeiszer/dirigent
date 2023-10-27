@@ -25,14 +25,14 @@ use std::{
 };
 
 use futures::future::BoxFuture;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	channel,
 	channel::{mpsc, oneshot, RecvError},
 	envelope::Envelope,
 	index,
-	scheduler::Scheduler,
+	scheduler::{ScheduleExt, Scheduler},
 	spawner::SubSpawner,
 	traits,
 	traits::{ExecuteOnDrop, ExitStatus, Index, InstanceError, Program, Spawner},
@@ -42,37 +42,57 @@ use crate::{
 const DEFAULT_PROCESS_SHUTDOWN_TIME: u64 = 5;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Pid(usize);
+pub enum Pid {
+	Parent { pid: usize },
+	Child { parent_pid: usize, child_pid: usize },
+}
+
+impl From<crate::Pid> for Pid {
+	fn from(value: crate::Pid) -> Self {
+		Pid::parent(value.0)
+	}
+}
+
+impl From<Pid> for crate::Pid {
+	fn from(value: Pid) -> Self {
+		crate::Pid::new(value.of_parent())
+	}
+}
+
 impl Pid {
-	pub fn new(pid: usize) -> Self {
-		Pid(pid)
+	pub fn child(parent_pid: usize, child_pid: usize) -> Self {
+		Self::Child {
+			parent_pid,
+			child_pid,
+		}
 	}
 
-	pub fn id(&self) -> usize {
-		self.0
+	pub fn parent(pid: usize) -> Self {
+		Self::Parent { pid }
+	}
+
+	pub fn of_parent(&self) -> usize {
+		match *self {
+			Pid::Parent { pid } => pid,
+			Pid::Child { parent_pid, .. } => parent_pid,
+		}
 	}
 }
 
 #[derive(Clone)]
-pub struct PidAllocation(Arc<AtomicUsize>);
+pub(crate) struct PidAllocation(Arc<AtomicUsize>);
 impl PidAllocation {
 	pub fn new() -> PidAllocation {
 		PidAllocation(Arc::new(AtomicUsize::new(1)))
 	}
 
 	pub fn pid(&self) -> Pid {
-		Pid(self.0.fetch_add(1, Ordering::Relaxed))
+		Pid::parent(self.0.fetch_add(1, Ordering::Relaxed))
 	}
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct SubPid {
-	parent: Pid,
-	sub: Pid,
-}
-
 #[derive(Clone)]
-pub struct SubPidAllocation {
+pub(crate) struct SubPidAllocation {
 	parent_pid: Pid,
 	sub_pid: Arc<AtomicUsize>,
 }
@@ -85,10 +105,10 @@ impl SubPidAllocation {
 		}
 	}
 
-	pub fn pid(&self) -> SubPid {
-		SubPid {
-			parent: self.parent_pid,
-			sub: Pid::new(self.sub_pid.fetch_add(1, Ordering::Relaxed)),
+	pub fn pid(&self) -> Pid {
+		Pid::Child {
+			parent_pid: self.parent_pid.of_parent(),
+			child_pid: self.sub_pid.fetch_add(1, Ordering::Relaxed),
 		}
 	}
 }
@@ -96,7 +116,7 @@ impl SubPidAllocation {
 pub type SPS<S> = SubSpawner<
 	<<<<S as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle,
 >;
-pub struct Spawnable<S, P> {
+pub(crate) struct Spawnable<S, P> {
 	/// The process ID of this process.
 	/// Unique for every process run by an dirigent instance
 	pub pid: Pid,
@@ -133,6 +153,7 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 
 	pub fn spawn(self) -> Process<SubSpawner<<<S as Spawner>::Handle as Spawner>::Handle>> {
 		let scheduler = Scheduler::new(self.pid);
+		let scheduler_ref = scheduler.reference(self.pid);
 		let sub_spawner = SubSpawner::new(
 			self.pid,
 			self.name,
@@ -170,20 +191,46 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 			Ok(())
 		});
 
-		sub_spawner.spawn_named(self.name, async move {
-			Box::new(self.program)
-				.start(
-					Box::new(context),
-					Box::new(index::IndexRegistry::new(index_registry_send)),
-				)
-				.await
+		let program = Box::new(self.program)
+			.start(
+				Box::new(context),
+				Box::new(index::IndexRegistry::new(index_registry_send)),
+			)
+			.schedule(scheduler_ref);
+		let name = self.name;
+		let pid = self.pid;
+
+		self.spawner.spawn_named(self.name, async move {
+			info!("Starting program \"{name}\"...");
+			let res = program.await;
+
+			match res {
+				Err(e) => {
+					warn!(
+						"Program \"{}\" [{:?}] exited with error: {:?}",
+						name, pid, e
+					)
+				}
+				Ok(inner_res) => {
+					if let Err(e) = inner_res {
+						warn!(
+							"Program \"{}\" [{:?}] exited with error: {:?}",
+							name, pid, e
+						)
+					} else {
+						info!("Program \"{}\" [{:?}] finished.", name, pid,)
+					}
+				}
+			}
+
+			Ok(())
 		});
 
 		process
 	}
 }
 
-pub struct Process<S>(Arc<InnerProcess<S>>);
+pub(crate) struct Process<S>(Arc<InnerProcess<S>>);
 
 unsafe impl<S: Send> Send for Process<S> {}
 unsafe impl<S: Sync> Sync for Process<S> {}
