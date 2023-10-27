@@ -16,9 +16,18 @@
 // limitations under the License.
 
 use std::sync::{
-	atomic::{AtomicBool, Ordering},
+	atomic::{AtomicBool, AtomicUsize, Ordering},
 	Arc,
 };
+
+use tracing::trace;
+
+// Idle state
+const LIVE: usize = 0;
+// Aquired lock for dropping
+const DROPPING: usize = 0b001;
+// Already dropped
+const DROPPED: usize = 0b010;
 
 struct Inner<T> {
 	safe: Arc<T>,
@@ -44,7 +53,7 @@ impl<T> Drop for Inner<T> {
 
 pub struct Updater<T> {
 	raw: *const Inner<T>,
-	dropped: Arc<AtomicBool>,
+	dropped: Arc<AtomicUsize>,
 }
 
 impl<T> Updater<T> {
@@ -71,10 +80,25 @@ impl<T> Updater<T> {
 
 impl<T> Drop for Updater<T> {
 	fn drop(&mut self) {
-		if self.dropped.load(Ordering::SeqCst) {
-			unsafe { drop(Arc::from_raw(self.raw)) }
-		} else {
-			self.dropped.store(true, Ordering::SeqCst)
+		match self
+			.dropped
+			.compare_exchange(LIVE, DROPPING, Ordering::Acquire, Ordering::Acquire)
+			.unwrap_or_else(|x| x)
+		{
+			LIVE => {
+				// We are safe to store dropped as relaxed as we cleared contention in the above
+				// `compare_exchange`
+				self.dropped.store(DROPPED, Ordering::Relaxed);
+			}
+			DROPPING => {
+				// The Updater raced us and we must drop the raw pointer
+				unsafe { drop(Arc::from_raw(self.raw)) };
+			}
+			DROPPED => {
+				// The updater already dropped. We can safely dereference the raw pointer
+				unsafe { drop(Arc::from_raw(self.raw)) };
+			}
+			_ => unreachable!("All values are covered. qed."),
 		}
 	}
 }
@@ -84,12 +108,12 @@ unsafe impl<P> Sync for Updater<P> {}
 
 pub struct Updatable<T> {
 	raw: *const Inner<T>,
-	dropped: Arc<AtomicBool>,
+	dropped: Arc<AtomicUsize>,
 }
 
 impl<T> Updatable<T> {
 	pub fn new(t: T) -> (Self, Updater<T>) {
-		let drop = Arc::new(AtomicBool::new(false));
+		let drop = Arc::new(AtomicUsize::new(LIVE));
 		let raw = Arc::into_raw(Arc::new(Inner::new(t)));
 		let updatable = Updatable {
 			raw,
@@ -112,19 +136,64 @@ unsafe impl<P> Sync for Updatable<P> {}
 
 impl<T> Drop for Updatable<T> {
 	fn drop(&mut self) {
-		if self.dropped.load(Ordering::SeqCst) {
-			unsafe { drop(Arc::from_raw(self.raw)) }
-		} else {
-			self.dropped.store(true, Ordering::SeqCst)
+		match self
+			.dropped
+			.compare_exchange(LIVE, DROPPING, Ordering::Acquire, Ordering::Acquire)
+			.unwrap_or_else(|x| x)
+		{
+			LIVE => {
+				// We are safe to store dropped as relaxed as we cleared contention in the above
+				// `compare_exchange`
+				self.dropped.store(DROPPED, Ordering::Relaxed);
+			}
+			DROPPING => {
+				// The Updater raced us and we must drop the raw pointer
+				unsafe { drop(Arc::from_raw(self.raw)) };
+			}
+			DROPPED => {
+				// The updater already dropped. We can safely dereference the raw pointer
+				unsafe { drop(Arc::from_raw(self.raw)) };
+			}
+			_ => unreachable!("All values are covered. qed."),
 		}
 	}
 }
 
 #[cfg(test)]
 mod test {
-	use std::thread;
+	use std::{
+		sync::{
+			atomic::{AtomicBool, Ordering},
+			Arc,
+		},
+		thread,
+	};
 
 	use crate::updatable::Updatable;
+
+	#[test]
+	fn contention() {
+		let _ = tracing_subscriber::fmt::try_init();
+
+		let sync = Arc::new(AtomicBool::new(false));
+
+		for _ in 0..100 {
+			let first = vec![1u8, 2u8, 3u8];
+			let (updatable, updater) = Updatable::new(first);
+			let s_clone = sync.clone();
+			thread::spawn(move || {
+				while !s_clone.load(Ordering::Acquire) {}
+				drop(updatable)
+			});
+			let s_clone = sync.clone();
+			thread::spawn(move || {
+				while !s_clone.load(Ordering::Acquire) {}
+				drop(updater)
+			});
+		}
+
+		sync.store(true, Ordering::SeqCst)
+	}
 
 	#[test]
 	fn it_works() {
