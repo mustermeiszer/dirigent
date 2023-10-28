@@ -5,6 +5,12 @@ edition = "2021"
 repository = "https://github.com/mustermeiszer/dirigent.git"
 version = "0.1.0"
 
+[workspace]
+resolver = "2"
+members = [
+    "benchmarks"
+]
+
 [dependencies]
 futures = "0.3.28"
 dyn-clone = "1.0.11"

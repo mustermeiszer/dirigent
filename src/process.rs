@@ -327,9 +327,10 @@ impl<S: Spawner> Process<S> {
 
 	pub fn consume(&self, envelopes: Arc<Vec<Envelope>>) {
 		debug!(
-			"Process \"{} [{:?}]\" consuming {:?}",
+			"Process \"{} [{:?}]\" consuming (amount: {}): {:?}",
 			self.name(),
 			self.pid(),
+			envelopes.len(),
 			envelopes
 		);
 
@@ -341,7 +342,7 @@ impl<S: Spawner> Process<S> {
 				.spawner
 				.spawn_named("EnvelopeConsumption", async move {
 					for envelope in envelopes.iter() {
-						if index.indexed(&envelope) {
+						if index.indexed(&envelope).await {
 							process_ref
 								.0
 								.process_to_program_send

@@ -47,13 +47,15 @@ pub trait Message: Send + Sync + 'static {
 	fn read(&self) {}
 }
 
+#[async_trait::async_trait]
 pub trait Index: Send + Sync + 'static {
-	fn indexed(&self, t: &Envelope) -> bool;
+	async fn indexed(&self, t: &Envelope) -> bool;
 }
 
+#[async_trait::async_trait]
 impl Index for Box<dyn Index> {
-	fn indexed(&self, t: &Envelope) -> bool {
-		(**self).indexed(t)
+	async fn indexed(&self, t: &Envelope) -> bool {
+		(**self).indexed(t).await
 	}
 }
 

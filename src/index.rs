@@ -22,16 +22,16 @@ use tracing::error;
 use crate::{channel, envelope::Envelope, traits, traits::Index};
 
 pub struct FullIndex;
-impl Index for FullIndex {
-	fn indexed(&self, _t: &Envelope) -> bool {
-		true
+impl FullIndex {
+	pub fn new() -> Self {
+		FullIndex {}
 	}
 }
 
-pub struct EmptyIndex;
-impl Index for EmptyIndex {
-	fn indexed(&self, _t: &Envelope) -> bool {
-		false
+#[async_trait::async_trait]
+impl Index for FullIndex {
+	async fn indexed(&self, _t: &Envelope) -> bool {
+		true
 	}
 }
 
