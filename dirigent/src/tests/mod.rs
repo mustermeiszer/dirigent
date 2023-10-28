@@ -23,7 +23,7 @@ use tracing::{debug, info};
 use crate as dirigent;
 use crate::{
 	envelope::Envelope,
-	traits::{Context, ExitStatus, Index, IndexRegistry, InstanceError, Program},
+	traits::{Context, ExitStatus, Index, IndexRegistry, Program},
 	Pid,
 };
 
@@ -96,8 +96,9 @@ impl NotFromSelf {
 	}
 }
 
+#[async_trait::async_trait]
 impl Index for NotFromSelf {
-	fn indexed(&self, t: &Envelope) -> bool {
+	async fn indexed(&self, t: &Envelope) -> bool {
 		t.try_read_ref::<Message, _, _>(|m| m.from != self.name)
 			.unwrap_or(false)
 	}
@@ -112,7 +113,7 @@ fn it_works() {
 	let rt = Runtime::new().unwrap();
 	let (dirigent, takt) = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
 
-	let mut takt_clone = takt.clone();
+	let takt_clone = takt.clone();
 	rt.spawn(async move {
 		futures_timer::Delay::new(Duration::from_secs(1)).await;
 		let pid_1 = takt_clone
@@ -133,7 +134,7 @@ fn it_works() {
 		takt_clone.force_shutdown().await.unwrap();
 	});
 
-	let mut takt_clone = takt.clone();
+	let takt_clone = takt.clone();
 	rt.spawn(async move {
 		futures_timer::Delay::new(Duration::from_secs(10)).await;
 		takt_clone.force_shutdown().await.unwrap();
@@ -157,7 +158,7 @@ fn killing_all_when_dirigent_dropped() {
 	let rt = Runtime::new().unwrap();
 	let (dirigent, takt) = dirigent::Dirigent::<Box<dyn Program>, _>::new(rt.handle().clone());
 
-	let mut takt_clone = takt.clone();
+	let takt_clone = takt.clone();
 	rt.spawn(async move {
 		futures_timer::Delay::new(Duration::from_secs(1)).await;
 		let pid_1 = takt_clone
