@@ -24,8 +24,8 @@ use crate::instrums::{consumer_all::ConsumerAll, consumer_slow::ConsumerSlow, sp
 
 mod instrums;
 
-const SEND_MESSAGES: usize = 100_000;
-const AMOUNT_CONSUMER: usize = 100;
+const SEND_MESSAGES: usize = 1_0000;
+const AMOUNT_CONSUMER: usize = 10;
 const DELAY: u64 = 1;
 
 #[tokio::main]

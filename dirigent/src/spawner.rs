@@ -174,6 +174,7 @@ impl<S: Spawner> Spawner for SubSpawner<S> {
 	}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Spawner for tokio::runtime::Handle {
 	type Handle = Self;
 
@@ -190,6 +191,7 @@ impl Spawner for tokio::runtime::Handle {
 	}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Spawner for tokio::runtime::Runtime {
 	type Handle = tokio::runtime::Handle;
 
@@ -203,5 +205,25 @@ impl Spawner for tokio::runtime::Runtime {
 
 	fn handle(&self) -> Self::Handle {
 		self.handle().clone()
+	}
+}
+
+/// A wrapper type that allows to implement external traits for
+/// all generic types that implement `trait Spawner`.
+pub struct Wrapper<T: Spawner>(T);
+
+#[cfg(feature = "libp2p")]
+impl<T: Spawner> libp2p_swarm::Executor for Wrapper<T> {
+	fn exec(
+		&self,
+		future: core::pin::Pin<
+			Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>,
+		>,
+	) {
+		self.0.spawn(async move {
+			let _ = future.await;
+
+			Ok(())
+		})
 	}
 }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "benchmarks",
-    "dirigent"
+    "dirigent",
+    "instrum-p2p"
 ]
 

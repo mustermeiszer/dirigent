@@ -74,6 +74,7 @@ impl<const MSGS: usize> Program for ConsumerSlow<MSGS> {
 			ctx.recv().await.unwrap().read_ref::<Message>().unwrap();
 			count += 1;
 
+			futures_timer::Delay::new(self.delay).await;
 			if count == MSGS {
 				let elapsed = start.elapsed();
 				self.ret.send(("Slow", elapsed)).await.unwrap();
