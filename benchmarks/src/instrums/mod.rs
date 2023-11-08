@@ -14,3 +14,19 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+pub mod consumer_all;
+pub mod consumer_slow;
+pub mod spammer;
+
+/// Benchmarking message
+pub struct Message;
+
+impl Message {
+	pub fn new() -> Self {
+		Message
+	}
+}
+
+impl dirigent::traits::Message for Message {
+	fn read(&self) {}
+}
