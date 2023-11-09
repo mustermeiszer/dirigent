@@ -226,10 +226,10 @@ impl<T: traits::SubSpawner> libp2p_swarm::Executor for Wrapper<T> {
 			Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>,
 		>,
 	) {
-		self.0.spawn_sub(async move {
-			let _ = future.await;
+		self.0.spawn_sub(Box::pin(async move {
+			future.await;
 
 			Ok(())
-		})
+		}))
 	}
 }
