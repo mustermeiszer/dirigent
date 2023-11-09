@@ -210,23 +210,23 @@ impl Spawner for tokio::runtime::Runtime {
 
 /// A wrapper type that allows to implement external traits for
 /// all generic types that implement `trait Spawner`.
-pub struct Wrapper<T: Spawner>(T);
+pub struct Wrapper<T: traits::SubSpawner>(T);
 
-impl<T: Spawner> Wrapper<T> {
+impl<T: traits::SubSpawner> Wrapper<T> {
 	pub fn new(t: T) -> Self {
 		Wrapper(t)
 	}
 }
 
 #[cfg(feature = "libp2p")]
-impl<T: Spawner> libp2p_swarm::Executor for Wrapper<T> {
+impl<T: traits::SubSpawner> libp2p_swarm::Executor for Wrapper<T> {
 	fn exec(
 		&self,
 		future: core::pin::Pin<
 			Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>,
 		>,
 	) {
-		self.0.spawn(async move {
+		self.0.spawn_sub(async move {
 			let _ = future.await;
 
 			Ok(())
