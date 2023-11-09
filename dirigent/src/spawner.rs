@@ -212,6 +212,12 @@ impl Spawner for tokio::runtime::Runtime {
 /// all generic types that implement `trait Spawner`.
 pub struct Wrapper<T: Spawner>(T);
 
+impl<T: Spawner> Wrapper<T> {
+	pub fn new(t: T) -> Self {
+		Wrapper(t)
+	}
+}
+
 #[cfg(feature = "libp2p")]
 impl<T: Spawner> libp2p_swarm::Executor for Wrapper<T> {
 	fn exec(
