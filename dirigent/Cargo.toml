@@ -3,7 +3,7 @@ name = "dirigent"
 authors = ["Frederik Gartenmeister <mustermeiszer@posteo.de>"]
 edition = "2021"
 repository = "https://github.com/mustermeiszer/dirigent.git"
-version = "0.1.0"
+version = "0.6.0"
 
 [dependencies]
 futures = "0.3.28"

@@ -167,6 +167,38 @@ pub trait Spawner: Send + Sync + 'static {
 	fn handle(&self) -> Self::Handle;
 }
 
+impl<T: Spawner> Spawner for Box<T> {
+	type Handle = T::Handle;
+
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		(**self).spawn_blocking(future)
+	}
+
+	fn spawn_blocking_named(
+		&self,
+		name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
+	) {
+		(**self).spawn_blocking_named(name, future)
+	}
+
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		(**self).spawn(future)
+	}
+
+	fn spawn_named(
+		&self,
+		name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
+	) {
+		(**self).spawn_named(name, future)
+	}
+
+	fn handle(&self) -> Self::Handle {
+		(**self).handle()
+	}
+}
+
 pub trait SubSpawner: Send + 'static {
 	/// Spawn the given blocking future.
 	fn spawn_sub_blocking(&self, future: BoxFuture<'static, ExitStatus>);

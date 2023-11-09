@@ -227,3 +227,19 @@ impl<T: Spawner> libp2p_swarm::Executor for Wrapper<T> {
 		})
 	}
 }
+
+#[cfg(feature = "libp2p")]
+impl<T: traits::SubSpawner> libp2p_swarm::Executor for Wrapper<T> {
+	fn exec(
+		&self,
+		future: core::pin::Pin<
+			Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>,
+		>,
+	) {
+		traits::SubSpawner::spawn_sub(&self.0, async move {
+			let _ = future.await;
+
+			Ok(())
+		})
+	}
+}
