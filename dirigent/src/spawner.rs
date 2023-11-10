@@ -243,7 +243,7 @@ impl libp2p_swarm::Executor for SubSpawner {
 		>,
 	) {
 		traits::SubSpawner::spawn_sub(
-			&self,
+			self,
 			Box::pin(async move {
 				future.await;
 
