@@ -33,7 +33,7 @@ use crate::{
 	envelope::Envelope,
 	index,
 	scheduler::{ScheduleExt, Scheduler},
-	spawner::SubSpawner,
+	spawner::{ProcessSpawner, SubSpawner},
 	traits,
 	traits::{ExecuteOnDrop, ExitStatus, Index, InstanceError, Program, Spawner},
 	updatable::Updatable,
@@ -113,7 +113,7 @@ impl SubPidAllocation {
 	}
 }
 
-pub type SPS<S> = SubSpawner<
+pub type SPS<S> = ProcessSpawner<
 	<<<<S as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle as Spawner>::Handle,
 >;
 pub(crate) struct Spawnable<S, P> {
@@ -151,10 +151,10 @@ impl<P: Program, S: Spawner> Spawnable<S, P> {
 		}
 	}
 
-	pub fn spawn(self) -> Process<SubSpawner<<<S as Spawner>::Handle as Spawner>::Handle>> {
+	pub fn spawn(self) -> Process<ProcessSpawner<<<S as Spawner>::Handle as Spawner>::Handle>> {
 		let scheduler = Scheduler::new(self.pid);
 		let scheduler_ref = scheduler.reference(self.pid);
-		let sub_spawner = SubSpawner::new(
+		let sub_spawner = ProcessSpawner::new(
 			self.pid,
 			self.name,
 			scheduler.clone(),
@@ -481,7 +481,9 @@ where
 		self.spawner.spawn_blocking(sub)
 	}
 
-	fn sub_spawner(&self) -> Box<dyn traits::SubSpawner> {
-		Box::new(self.spawner.handle())
+	fn sub_spawner(&self) -> SubSpawner {
+		SubSpawner {
+			inner: Box::new(self.spawner.handle()),
+		}
 	}
 }

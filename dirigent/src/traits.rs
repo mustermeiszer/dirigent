@@ -23,6 +23,7 @@ use crate::{
 	channel,
 	channel::{RecvError, SendError},
 	envelope::Envelope,
+	spawner,
 };
 
 pub type ExitStatus = Result<(), InstanceError>;
@@ -100,7 +101,7 @@ pub trait Context: Send + Sync + 'static {
 
 	fn spawn_sub_blocking(&self, sub: BoxFuture<'static, ExitStatus>);
 
-	fn sub_spawner(&self) -> Box<dyn SubSpawner>;
+	fn sub_spawner(&self) -> spawner::SubSpawner;
 }
 
 #[async_trait::async_trait]
@@ -133,13 +134,13 @@ impl Context for Box<dyn Context> {
 		(**self).spawn_sub_blocking(sub)
 	}
 
-	fn sub_spawner(&self) -> Box<dyn SubSpawner> {
+	fn sub_spawner(&self) -> spawner::SubSpawner {
 		(**self).sub_spawner()
 	}
 }
 
 pub trait Spawner: Send + Sync + 'static {
-	type Handle: Spawner;
+	type Handle: Spawner + SubSpawner;
 
 	/// Spawn the given blocking future.
 	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static);
@@ -199,6 +200,8 @@ impl<T: Spawner> Spawner for Box<T> {
 	}
 }
 
+/// Internal trait to get rid of Handle while still being able to use
+/// a trait Object.
 pub trait SubSpawner: Send + 'static {
 	/// Spawn the given blocking future.
 	fn spawn_sub_blocking(&self, future: BoxFuture<'static, ExitStatus>);

@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::future::Future;
+use futures::future::{BoxFuture, Future};
 use tracing::{debug, warn};
 
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
 	traits::{ExitStatus, Spawner},
 };
 
-pub struct SubSpawner<Spawner> {
+pub struct ProcessSpawner<Spawner> {
 	parent_pid: Pid,
 	parent_name: &'static str,
 	scheduler: Scheduler,
@@ -33,14 +33,14 @@ pub struct SubSpawner<Spawner> {
 	pid_allocation: SubPidAllocation,
 }
 
-impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
+impl<Spawner: traits::Spawner> ProcessSpawner<Spawner> {
 	pub fn new(
 		parent_pid: Pid,
 		parent_name: &'static str,
 		scheduler: Scheduler,
 		spawner: Spawner,
 	) -> Self {
-		SubSpawner {
+		ProcessSpawner {
 			parent_pid,
 			parent_name,
 			scheduler,
@@ -136,8 +136,8 @@ impl<Spawner: traits::Spawner> SubSpawner<Spawner> {
 	}
 }
 
-impl<S: Spawner> Spawner for SubSpawner<S> {
-	type Handle = SubSpawner<S::Handle>;
+impl<S: Spawner> Spawner for ProcessSpawner<S> {
+	type Handle = ProcessSpawner<S::Handle>;
 
 	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
 		self.spawn_blocking_named(future, "_sub_blocking", self.pid_allocation.pid())
@@ -164,7 +164,7 @@ impl<S: Spawner> Spawner for SubSpawner<S> {
 	}
 
 	fn handle(&self) -> Self::Handle {
-		SubSpawner {
+		ProcessSpawner {
 			parent_name: self.parent_name,
 			parent_pid: self.parent_pid,
 			spawner: self.spawner.handle(),
@@ -208,28 +208,47 @@ impl Spawner for tokio::runtime::Runtime {
 	}
 }
 
-/// A wrapper type that allows to implement external traits for
-/// all generic types that implement `trait Spawner`.
-pub struct Wrapper<T: traits::SubSpawner>(T);
+pub struct SubSpawner {
+	pub(crate) inner: Box<dyn traits::SubSpawner>,
+}
 
-impl<T: traits::SubSpawner> Wrapper<T> {
-	pub fn new(t: T) -> Self {
-		Wrapper(t)
+impl traits::SubSpawner for SubSpawner {
+	/// Spawn the given blocking future.
+	fn spawn_sub_blocking(&self, future: BoxFuture<'static, ExitStatus>) {
+		self.inner.spawn_sub_blocking(future)
+	}
+
+	/// Spawn the given non-blocking future.
+	fn spawn_sub(&self, future: BoxFuture<'static, ExitStatus>) {
+		self.inner.spawn_sub(future)
+	}
+
+	/// Spawn the given blocking future.
+	fn spawn_sub_blocking_named(&self, name: &'static str, future: BoxFuture<'static, ExitStatus>) {
+		self.inner.spawn_sub_blocking_named(name, future)
+	}
+
+	/// Spawn the given non-blocking future.
+	fn spawn_sub_named(&self, name: &'static str, future: BoxFuture<'static, ExitStatus>) {
+		self.inner.spawn_sub_named(name, future)
 	}
 }
 
 #[cfg(feature = "libp2p")]
-impl<T: traits::SubSpawner> libp2p_swarm::Executor for Wrapper<T> {
+impl libp2p_swarm::Executor for SubSpawner {
 	fn exec(
 		&self,
 		future: core::pin::Pin<
 			Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>,
 		>,
 	) {
-		self.0.spawn_sub(Box::pin(async move {
-			future.await;
+		traits::SubSpawner::spawn_sub(
+			&self,
+			Box::pin(async move {
+				future.await;
 
-			Ok(())
-		}))
+				Ok(())
+			}),
+		)
 	}
 }
