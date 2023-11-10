@@ -234,14 +234,9 @@ impl traits::SubSpawner for SubSpawner {
 	}
 }
 
-#[cfg(feature = "libp2p")]
+#[cfg(any(feature = "libp2p", test))]
 impl libp2p_swarm::Executor for SubSpawner {
-	fn exec(
-		&self,
-		future: core::pin::Pin<
-			Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>,
-		>,
-	) {
+	fn exec(&self, future: BoxFuture<'static, ()>) {
 		traits::SubSpawner::spawn_sub(
 			self,
 			Box::pin(async move {
@@ -250,5 +245,25 @@ impl libp2p_swarm::Executor for SubSpawner {
 				Ok(())
 			}),
 		)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use tokio::runtime::Handle;
+
+	use crate::{spawner::SubSpawner, traits};
+
+	#[tokio::test]
+	async fn usage_as_generic_works() {
+		fn inner<S: traits::SubSpawner>(_s: S) {}
+
+		let handle = Handle::current();
+
+		let sub_spawner = SubSpawner {
+			inner: Box::new(handle),
+		};
+
+		inner(sub_spawner)
 	}
 }
