@@ -231,37 +231,3 @@ impl traits::SubSpawner for SubSpawner {
 		self.inner.spawn_sub_named(name, future)
 	}
 }
-
-#[cfg(any(feature = "p2p", test))]
-impl libp2p::swarm::Executor for SubSpawner {
-	fn exec(&self, future: BoxFuture<'static, ()>) {
-		traits::SubSpawner::spawn_sub(
-			self,
-			Box::pin(async move {
-				future.await;
-
-				Ok(())
-			}),
-		)
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use tokio::runtime::Handle;
-
-	use crate::{spawner::SubSpawner, traits};
-
-	#[tokio::test]
-	async fn usage_as_generic_works() {
-		fn inner<S: traits::SubSpawner>(_s: S) {}
-
-		let handle = Handle::current();
-
-		let sub_spawner = SubSpawner {
-			inner: Box::new(handle),
-		};
-
-		inner(sub_spawner)
-	}
-}
