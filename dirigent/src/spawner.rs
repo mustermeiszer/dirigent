@@ -57,7 +57,6 @@ impl<Spawner: traits::Spawner> ProcessSpawner<Spawner> {
 	) {
 		let future = future.schedule(self.scheduler.reference(pid));
 
-		let name = name.clone();
 		let parent_pid = self.parent_pid;
 		let parent_name = self.parent_name;
 
@@ -100,7 +99,6 @@ impl<Spawner: traits::Spawner> ProcessSpawner<Spawner> {
 	) {
 		let future = future.schedule(self.scheduler.reference(pid));
 
-		let name = name.clone();
 		let parent_pid = self.parent_pid;
 		let parent_name = self.parent_name;
 
@@ -234,8 +232,8 @@ impl traits::SubSpawner for SubSpawner {
 	}
 }
 
-#[cfg(any(feature = "libp2p", test))]
-impl libp2p_swarm::Executor for SubSpawner {
+#[cfg(any(feature = "p2p", test))]
+impl libp2p::swarm::Executor for SubSpawner {
 	fn exec(&self, future: BoxFuture<'static, ()>) {
 		traits::SubSpawner::spawn_sub(
 			self,

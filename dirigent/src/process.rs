@@ -15,6 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cell::UnsafeCell;
 use std::{
 	fmt::{Debug, Formatter},
 	sync::{
@@ -35,7 +36,7 @@ use crate::{
 	scheduler::{ScheduleExt, Scheduler},
 	spawner::{ProcessSpawner, SubSpawner},
 	traits,
-	traits::{ExecuteOnDrop, ExitStatus, Index, InstanceError, Program, Spawner},
+	traits::{ExecuteOnDrop, ExitStatus, InstanceError, Program, Spawner},
 	updatable::Updatable,
 };
 
@@ -265,17 +266,14 @@ impl<S: Spawner> Process<S> {
 			scheduler,
 			alive: AtomicBool::new(true),
 			process_to_program_send,
-			index: None,
+			index: Index::new(),
 		}))
 	}
 
 	// NOTE ON SAFETY: This is safe as the method is a private interface and is ONLY
 	//                 called once during `IndexRegistration`
-	fn set_index(&self, index: Arc<dyn Index>) {
-		let raw = self.0.as_ref() as *const InnerProcess<S> as *mut InnerProcess<S>;
-
-		let inner_mut = unsafe { &mut *raw };
-		inner_mut.index = Some(index);
+	fn set_index(&self, index: Arc<dyn traits::Index>) {
+		self.0.index.set(index)
 	}
 
 	pub fn name(&self) -> &'static str {
@@ -334,7 +332,7 @@ impl<S: Spawner> Process<S> {
 			envelopes
 		);
 
-		if let Some(ref index) = self.0.index {
+		if let Some(ref index) = self.0.index.get() {
 			let process_ref = self.clone();
 			let index = index.clone();
 
@@ -369,6 +367,35 @@ impl<S: Spawner> Process<S> {
 	}
 }
 
+struct Index {
+	inner: UnsafeCell<Option<Arc<dyn traits::Index>>>,
+}
+
+impl Index {
+	fn new() -> Self {
+		Index {
+			inner: UnsafeCell::new(None),
+		}
+	}
+
+	fn set(&self, index: Arc<dyn traits::Index>) {
+		unsafe {
+			self.inner.get().write(Some(index));
+		}
+	}
+
+	fn get(&self) -> &Option<Arc<dyn traits::Index>> {
+		unsafe {
+			let raw = &*self.inner.get();
+
+			raw
+		}
+	}
+}
+
+unsafe impl Send for Index {}
+unsafe impl Sync for Index {}
+
 /// A process is spawned by dirigent and provides all means to control a given
 /// program. It provides means to
 /// * communicate with the program
@@ -389,7 +416,7 @@ struct InnerProcess<S> {
 	/// The index of the program.
 	/// * filters messages received from bus
 	/// * indexed messages are forwarded to the program
-	index: Option<Arc<dyn Index>>,
+	index: Index,
 
 	/// The scheduler for all state-machines spawned from this process
 	scheduler: Scheduler,
