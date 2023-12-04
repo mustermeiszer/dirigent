@@ -172,7 +172,7 @@ impl<S: Spawner> Spawner for ProcessSpawner<S> {
 	}
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "tokio")]
 impl Spawner for tokio::runtime::Handle {
 	type Handle = Self;
 
@@ -189,9 +189,26 @@ impl Spawner for tokio::runtime::Handle {
 	}
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "tokio")]
 impl Spawner for tokio::runtime::Runtime {
 	type Handle = tokio::runtime::Handle;
+
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawn_blocking(|| future);
+	}
+
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		self.spawn(future);
+	}
+
+	fn handle(&self) -> Self::Handle {
+		self.handle().clone()
+	}
+}
+
+#[cfg(feature = "async-std")]
+impl Spawner for asyncstd::task {
+	type Handle = asyncstd::task;
 
 	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
 		self.spawn_blocking(|| future);

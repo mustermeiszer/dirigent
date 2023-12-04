@@ -100,11 +100,14 @@ enum Command<P> {
 //       of leaking an owned valued of `trait Program`.
 unsafe impl<P: Send> Send for Command<P> {}
 
+const DEFAULT_BUS_SIZE: usize = 1024;
+const DEFAULT_MAX_MSG_BATCH_SIZE: usize = 128;
+
 pub struct Dirigent<
 	P: Program,
 	Spawner,
-	const BUS_SIZE: usize = 1024,
-	const MAX_MSG_BATCH_SIZE: usize = 128,
+	const BUS_SIZE: usize = DEFAULT_BUS_SIZE,
+	const MAX_MSG_BATCH_SIZE: usize = DEFAULT_MAX_MSG_BATCH_SIZE,
 > {
 	spawner: Spawner,
 	takt_to_dirigent_recv: mpsc::Receiver<Command<P>>,
@@ -113,7 +116,12 @@ pub struct Dirigent<
 impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: usize>
 	Dirigent<P, S, BUS_SIZE, MAX_MSG_BATCH_SIZE>
 {
-	pub fn new(spawner: S) -> (Self, Takt<P>) {
+	pub fn new(
+		spawner: S,
+	) -> (
+		Dirigent<P, S, DEFAULT_BUS_SIZE, DEFAULT_MAX_MSG_BATCH_SIZE>,
+		Takt<P>,
+	) {
 		let (takt_to_dirigent_send, takt_to_dirigent_recv) = mpsc::channel();
 		(
 			Dirigent {
@@ -126,6 +134,23 @@ impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: us
 		)
 	}
 
+	pub fn with_sizes<const CUSTOM_BUS_SIZE: usize, const CUSTOM_MAX_MSG_BATCH_SIZE: usize>(
+		spawner: S,
+	) -> (
+		Dirigent<P, S, CUSTOM_BUS_SIZE, CUSTOM_MAX_MSG_BATCH_SIZE>,
+		Takt<P>,
+	) {
+		let (takt_to_dirigent_send, takt_to_dirigent_recv) = mpsc::channel();
+		(
+			Dirigent {
+				spawner,
+				takt_to_dirigent_recv,
+			},
+			Takt {
+				sender: takt_to_dirigent_send,
+			},
+		)
+	}
 	pub async fn begin(self) -> ExitStatus {
 		let Dirigent {
 			spawner,
