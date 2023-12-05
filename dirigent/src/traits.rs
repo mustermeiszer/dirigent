@@ -200,6 +200,38 @@ impl<T: Spawner> Spawner for Box<T> {
 	}
 }
 
+impl<T: Spawner> Spawner for Arc<T> {
+	type Handle = T::Handle;
+
+	fn spawn_blocking(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		(**self).spawn_blocking(future)
+	}
+
+	fn spawn_blocking_named(
+		&self,
+		name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
+	) {
+		(**self).spawn_blocking_named(name, future)
+	}
+
+	fn spawn(&self, future: impl Future<Output = ExitStatus> + Send + 'static) {
+		(**self).spawn(future)
+	}
+
+	fn spawn_named(
+		&self,
+		name: &'static str,
+		future: impl Future<Output = ExitStatus> + Send + 'static,
+	) {
+		(**self).spawn_named(name, future)
+	}
+
+	fn handle(&self) -> Self::Handle {
+		(**self).handle()
+	}
+}
+
 /// Internal trait to get rid of Handle while still being able to use
 /// a trait Object.
 pub trait SubSpawner: Send + 'static {
