@@ -116,12 +116,7 @@ pub struct Dirigent<
 impl<P: Program, S: Spawner, const BUS_SIZE: usize, const MAX_MSG_BATCH_SIZE: usize>
 	Dirigent<P, S, BUS_SIZE, MAX_MSG_BATCH_SIZE>
 {
-	pub fn new(
-		spawner: S,
-	) -> (
-		Dirigent<P, S, DEFAULT_BUS_SIZE, DEFAULT_MAX_MSG_BATCH_SIZE>,
-		Takt<P>,
-	) {
+	pub fn new(spawner: S) -> (Self, Takt<P>) {
 		let (takt_to_dirigent_send, takt_to_dirigent_recv) = mpsc::channel();
 		(
 			Dirigent {

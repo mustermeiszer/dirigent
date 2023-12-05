@@ -244,6 +244,15 @@ pub trait ExecuteOnDrop: 'static {
 	fn execute(&mut self);
 }
 
+impl<F> ExecuteOnDrop for F
+where
+	F: FnOnce() + 'static + Clone,
+{
+	fn execute(&mut self) {
+		(self.clone())()
+	}
+}
+
 pub struct OnDrop<T: ExecuteOnDrop>(T);
 
 impl<T: ExecuteOnDrop> OnDrop<T> {
@@ -263,5 +272,23 @@ impl<T: ExecuteOnDrop> Deref for OnDrop<T> {
 
 	fn deref(&self) -> &Self::Target {
 		&self.0
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::traits::OnDrop;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+
+	#[test]
+	fn on_drop_with_fn() {
+		let atomic = Arc::new(AtomicUsize::new(0));
+		let clone = atomic.clone();
+		OnDrop::new(move || {
+			clone.fetch_add(1, Ordering::SeqCst);
+		});
+
+		assert_eq!(atomic.load(Ordering::SeqCst), 1);
 	}
 }
