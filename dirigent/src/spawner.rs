@@ -227,6 +227,14 @@ pub struct SubSpawner {
 	pub(crate) inner: Box<dyn traits::SubSpawner>,
 }
 
+impl SubSpawner {
+	pub fn new(spawner: impl Spawner) -> Self {
+		SubSpawner {
+			inner: Box::new(spawner),
+		}
+	}
+}
+
 impl traits::SubSpawner for SubSpawner {
 	/// Spawn the given blocking future.
 	fn spawn_sub_blocking(&self, future: BoxFuture<'static, ExitStatus>) {
