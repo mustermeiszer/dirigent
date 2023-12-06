@@ -43,6 +43,12 @@ impl<M: Message> From<M> for Envelope {
 }
 
 impl Envelope {
+	pub fn new<M: Message>(inner: M) -> Self {
+		Envelope {
+			inner: Arc::new(inner),
+		}
+	}
+
 	pub fn message_id(&self) -> TypeId {
 		self.inner.type_id()
 	}
